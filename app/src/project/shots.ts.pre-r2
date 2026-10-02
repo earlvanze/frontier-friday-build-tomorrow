@@ -1,0 +1,1589 @@
+// Frontier Friday compositions. A neural spark becomes a signal on a wire, the signal becomes a plan, the plan a street,
+// a house, a ledger, a chain — and the same city grows every chorus. The finale returns to the opening spark.
+// Rules: pure functions of s.t; words land on w.start; only signal/ember/acid go on the glow layer; lyric type is kept
+// >= 96 px inside the frame (shots that move the camera through a world reset to screen space before setting type).
+// "Earl Co" is always set in ordinary letterforms.
+import { W, H } from '../engine/gl';
+import { F, layout, measure } from '../engine/type';
+import type { Line, Word } from '../engine/lyrics';
+import { clamp, ease, hash, lerp, mulberry32, noise1, prog, pulse, springStep, TAU, polylineLengths, pointAtLength, type V2 } from '../engine/util';
+import { A, CAP, col, heat, appear, mix, note, rule, setFont, sizeFor, snapCam, clean, drawLetters, widthFam } from '../scenes/kit';
+import { cam, fitRow, rows, slam, txt, word, type S } from '../scenes/shots';
+import { BRAND } from './brand';
+
+const last = <T,>(a: T[]) => a[a.length - 1]!;
+const SCREEN = { x: W / 2, y: H / 2, z: 1, r: 0 };
+const screen = (s: S) => cam(s, SCREEN);
+/** 1 until the next line starts, then fades out quickly. */
+const until = (t: number, l?: Line) => (l ? 1 - prog(t, l.start - 0.12, l.start + 0.14) : 1);
+/** Scalar version of snapCam: holds, then snaps to vals[i] at times[i]. */
+function snapVal(t: number, times: number[], vals: number[], dur = 0.4, fn = ease.outExpo) {
+  let v = vals[0]!;
+  for (let i = 1; i < vals.length; i++) { if (t < times[i]!) break; v = lerp(v, vals[i]!, prog(t, times[i]!, times[i]! + dur, fn)); }
+  return v;
+}
+/** Fit a row of words and slam each in on its onset. */
+function row(s: S, ws: Word[], fam: string, width: number, max: number, x: number, y: number, o: { from?: number; alpha?: number; hot?: any; base?: any; small?: boolean } = {}) {
+  if (!ws.length) return null;
+  const fr = fitRow(ws.map(txt), fam, width, max);
+  ws.forEach((w, i) => word(s, w, txt(w), fam, fr.size, x + fr.xs[i]!, y, { sc: slam(w, s.t, o.from ?? 1.7), alpha: o.alpha, hot: o.hot, base: o.base }));
+  return fr;
+}
+/** Two balanced rows for one line. */
+const WEAK = /^(and|the|a|to|of|in|it|by|for|with|then|into|through|across|before)$/i;
+function split2(l: Line, _maxChars = 14): [Word[], Word[]] {
+  const ws = l.words;
+  if (ws.length < 3) return [ws, []];
+  const len = (a: Word[]) => a.reduce((n, w) => n + clean(w.w).length + 1, 0);
+  let best = 1, score = 1e9;
+  for (let i = 1; i < ws.length; i++) {
+    // balanced rows; never end row 1 on a weak word (it belongs with what follows)
+    const sc = Math.abs(len(ws.slice(0, i)) - len(ws.slice(i))) + (WEAK.test(clean(ws[i - 1]!.w)) ? 100 : 0);
+    if (sc < score) { score = sc; best = i; }
+  }
+  return [ws.slice(0, best), ws.slice(best)];
+}
+const findW = (l: Line, re: RegExp) => l.words.find((w) => re.test(clean(w.w))) ?? last(l.words);
+/** Dark band that keeps type readable over busy art. */
+function band(c: CanvasRenderingContext2D, y: number, h: number, a = 0.7) {
+  const gr = c.createLinearGradient(0, y - h / 2, 0, y + h / 2);
+  gr.addColorStop(0, col('ink', 0)); gr.addColorStop(0.25, col('ink', a)); gr.addColorStop(0.75, col('ink', a)); gr.addColorStop(1, col('ink', 0));
+  c.fillStyle = gr; c.fillRect(-W, y - h / 2, 3 * W, h);
+}
+
+// ------------------------------------------------------------------ circuit traces (cached, deterministic)
+type Tr = { pts: V2[]; L: Float32Array; len: number; d: number };
+const TR = new Map<string, Tr[]>();
+function traces(key: string, seed: number, n: number, cx: number, cy: number, rx: number, ry: number): Tr[] {
+  const hit = TR.get(key); if (hit) return hit;
+  const r = mulberry32(seed); const out: Tr[] = [];
+  for (let i = 0; i < n; i++) {
+    const ang = (i / n) * TAU + r() * 0.35;
+    let x = cx + Math.cos(ang) * 40, y = cy + Math.sin(ang) * 40;
+    const pts: V2[] = [{ x, y }];
+    let horiz = Math.abs(Math.cos(ang)) > Math.abs(Math.sin(ang));
+    const segs = 3 + Math.floor(r() * 3);
+    for (let j = 0; j < segs; j++) {
+      const span = horiz ? rx : ry;
+      const L = (0.35 + r() * 0.65) * span / segs * 1.6;
+      if (horiz) x += Math.sign(Math.cos(ang) || 1) * L; else y += Math.sign(Math.sin(ang) || 1) * L;
+      pts.push({ x, y }); horiz = !horiz;
+    }
+    const Ls = polylineLengths(pts); out.push({ pts, L: Ls, len: Ls[Ls.length - 1]!, d: r() });
+  }
+  TR.set(key, out); return out;
+}
+function drawTr(c: CanvasRenderingContext2D, tr: Tr, k: number, stroke: string, w = 2.5, pad = true) {
+  if (k <= 0) return;
+  const sl = clamp(k) * tr.len;
+  c.strokeStyle = stroke; c.lineWidth = w; c.lineJoin = 'round'; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(tr.pts[0]!.x, tr.pts[0]!.y);
+  for (let i = 1; i < tr.pts.length; i++) {
+    if (tr.L[i]! <= sl) c.lineTo(tr.pts[i]!.x, tr.pts[i]!.y);
+    else { const p = pointAtLength(tr.pts, tr.L, sl); c.lineTo(p.x, p.y); break; }
+  }
+  c.stroke();
+  if (pad && k >= 1) { const e = last(tr.pts); c.beginPath(); c.arc(e.x, e.y, w * 2.6, 0, TAU); c.stroke(); }
+}
+function head(g: CanvasRenderingContext2D, pts: V2[], L: Float32Array, at: number, color: string, r = 7) {
+  const p = pointAtLength(pts, L, at);
+  g.fillStyle = color; g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fill();
+  return p;
+}
+
+// ------------------------------------------------------------------ the progressive city (same plan every chorus, grows with n)
+interface Bldg { x: number; w: number; h: number; st: number; seed: number }
+let CITY: Bldg[] | null = null;
+function cityPlan(): Bldg[] {
+  if (CITY) return CITY;
+  const r = mulberry32(7); const out: Bldg[] = [];
+  let x = -1600;
+  while (x < 5600) {
+    const w = 90 + r() * 150;
+    // stage 1 = the first sparse blocks; every chorus adds a stage
+    const q = r(); const st = q < 0.5 ? 1 : q < 0.7 ? 2 : q < 0.85 ? 3 : 4;
+    out.push({ x, w, h: 170 + r() * 400, st, seed: out.length });
+    x += w + 12 + r() * 34;
+  }
+  return (CITY = out);
+}
+function drawCity(s: S, n: number, gy: number, o: { lit?: number; a?: number; rise?: number; xs?: [number, number]; scale?: number } = {}) {
+  const { c, g, t } = s;
+  const lit = o.lit ?? 0.5, a = o.a ?? 1, sc = o.scale ?? 1;
+  const xs = o.xs ?? [-1e9, 1e9];
+  for (const b of cityPlan()) {
+    if (b.st > n || b.x + b.w < xs[0] || b.x > xs[1]) continue;
+    const grow = b.st === n ? (o.rise ?? 1) : 1;
+    const h = b.h * (0.55 + 0.15 * Math.min(4, n)) * grow * sc;
+    if (h < 2) continue;
+    const y0 = gy - h;
+    c.fillStyle = mix('ink2', 'graphite', 0.35 + 0.25 * hash(b.seed, 5), a); c.fillRect(b.x, y0, b.w, h);
+    c.strokeStyle = col('ash', 0.55 * a); c.lineWidth = 2; c.strokeRect(b.x, y0, b.w, h);
+    const cols = Math.max(2, Math.floor(b.w / 34)), rws = Math.floor((h - 20) / 40);
+    const cw = (b.w - 16) / cols;
+    for (let i = 0; i < cols; i++) for (let j = 0; j < rws; j++) {
+      const hv = hash(b.seed, i, j);
+      if (hv > lit * (0.5 + 0.1 * n)) continue;
+      const fl = 0.7 + 0.3 * Math.sin(t * (1 + hash(b.seed, j) * 3) + hv * 50);
+      const wx = b.x + 8 + i * cw + cw * 0.22, wy = y0 + 14 + j * 40;
+      c.fillStyle = col('acid', 0.85 * a * fl); c.fillRect(wx, wy, cw * 0.56, 16);
+      if (hv < lit * 0.18) { g.fillStyle = col('acid', 0.22 * a); g.fillRect(wx - 3, wy - 3, cw * 0.56 + 6, 22); }
+    }
+    if (hash(b.seed, 99) < 0.3 && h > 300) {
+      c.strokeStyle = col('graphite', a); c.lineWidth = 3;
+      c.beginPath(); c.moveTo(b.x + b.w / 2, y0); c.lineTo(b.x + b.w / 2, y0 - 60); c.stroke();
+      const blink = (Math.floor(t * 1.6 + b.seed) % 2) === 0 ? 1 : 0.15;
+      g.fillStyle = col('signal', 0.9 * blink * a); g.beginPath(); g.arc(b.x + b.w / 2, y0 - 62, 7, 0, TAU); g.fill();
+    }
+  }
+  // stage 4: rooftop network links between the tallest towers
+  if (n >= 4) {
+    const tops = cityPlan().filter((b) => hash(b.seed, 99) < 0.3 && b.x > xs[0] && b.x < xs[1]);
+    for (let i = 0; i + 1 < tops.length; i++) {
+      const a1 = tops[i]!, b1 = tops[i + 1]!;
+      const ya = gy - a1.h * 1.15 - 62, yb = gy - b1.h * 1.15 - 62;
+      const k = 0.5 + 0.5 * Math.sin(t * 2 + i);
+      g.strokeStyle = col('signal', 0.25 * k * a); g.lineWidth = 2;
+      g.beginPath(); g.moveTo(a1.x + a1.w / 2, ya); g.quadraticCurveTo((a1.x + b1.x) / 2 + 60, Math.min(ya, yb) - 120, b1.x + b1.w / 2, yb); g.stroke();
+    }
+  }
+  c.strokeStyle = col('bone', 0.5 * a); c.lineWidth = 3;
+  c.beginPath(); c.moveTo(xs[0] === -1e9 ? -2000 : xs[0], gy); c.lineTo(xs[1] === 1e9 ? 6000 : xs[1], gy); c.stroke();
+}
+
+// ------------------------------------------------------------------ icons
+function brickIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number) {
+  const bw = sz / 2.2, bh = sz / 5;
+  for (let r = 0; r < 4; r++) for (let i = -1; i < 3; i++) {
+    const bx = x - sz / 2 + i * bw + (r % 2) * bw / 2, by = y - sz / 2 + r * (bh + 4);
+    const x0 = Math.max(bx, x - sz / 2), x1 = Math.min(bx + bw - 4, x + sz / 2);
+    if (x1 <= x0) continue;
+    c.fillStyle = col('acid', 0.9 * a); c.fillRect(x0, by, x1 - x0, bh);
+  }
+}
+function blockIcon(c: CanvasRenderingContext2D, g: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number, label = '#') {
+  const h = sz / 2;
+  const P = (dx: number, dy: number) => [x + dx, y + dy] as const;
+  const top = [P(0, -h), P(h * 0.95, -h / 2), P(0, 0), P(-h * 0.95, -h / 2)];
+  const left = [P(-h * 0.95, -h / 2), P(0, 0), P(0, h), P(-h * 0.95, h / 2)];
+  const right = [P(h * 0.95, -h / 2), P(0, 0), P(0, h), P(h * 0.95, h / 2)];
+  const face = (pts: (readonly [number, number])[], f: string) => {
+    c.beginPath(); pts.forEach(([px, py], i) => (i ? c.lineTo(px, py) : c.moveTo(px, py))); c.closePath(); c.fillStyle = f; c.fill();
+    c.strokeStyle = col('signal', 0.9 * a); c.lineWidth = 3; c.stroke();
+  };
+  face(top, col('ink2', a)); face(left, col('ink', a)); face(right, col('ink2', a * 0.8));
+  g.strokeStyle = col('signal', 0.35 * a); g.lineWidth = 6; g.beginPath(); top.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py))); g.closePath(); g.stroke();
+  note(c, label, x, y - h / 2 + 8, a, Math.round(sz * 0.16), 'signal', 'center');
+}
+function codeIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number) {
+  setFont(c, F.mono(700), sz * 0.62); c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillStyle = col('signal', a); c.fillText('</>', x, y);
+  c.textBaseline = 'alphabetic';
+}
+function keyIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number, rot = 0, color = 'acid') {
+  c.save(); c.translate(x, y); c.rotate(rot);
+  c.strokeStyle = col(color, a); c.fillStyle = col(color, a); c.lineWidth = sz * 0.09;
+  const r = sz * 0.22;
+  c.beginPath(); c.arc(-sz * 0.3, 0, r, 0, TAU); c.stroke();
+  c.fillRect(-sz * 0.3 + r, -sz * 0.045, sz * 0.75, sz * 0.09);
+  c.fillRect(sz * 0.28, 0, sz * 0.07, sz * 0.16); c.fillRect(sz * 0.38, 0, sz * 0.06, sz * 0.12);
+  c.restore();
+}
+function gearIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number, rot = 0) {
+  c.save(); c.translate(x, y); c.rotate(rot);
+  c.fillStyle = col('bone', a);
+  for (let i = 0; i < 8; i++) { c.save(); c.rotate((i / 8) * TAU); c.fillRect(-sz * 0.07, -sz * 0.5, sz * 0.14, sz * 0.2); c.restore(); }
+  c.beginPath(); c.arc(0, 0, sz * 0.36, 0, TAU); c.fill();
+  c.fillStyle = col('ink', a); c.beginPath(); c.arc(0, 0, sz * 0.14, 0, TAU); c.fill();
+  c.restore();
+}
+function chipIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number) {
+  c.strokeStyle = col('signal', a); c.lineWidth = 3;
+  c.strokeRect(x - sz * 0.3, y - sz * 0.3, sz * 0.6, sz * 0.6);
+  for (let i = 0; i < 4; i++) {
+    const o = -sz * 0.21 + i * sz * 0.14;
+    rule(c, x + o, y - sz * 0.3, x + o, y - sz * 0.45, 1, col('signal', a), 3); rule(c, x + o, y + sz * 0.3, x + o, y + sz * 0.45, 1, col('signal', a), 3);
+    rule(c, x - sz * 0.3, y + o, x - sz * 0.45, y + o, 1, col('signal', a), 3); rule(c, x + sz * 0.3, y + o, x + sz * 0.45, y + o, 1, col('signal', a), 3);
+  }
+  note(c, 'AI', x, y + sz * 0.08, a, Math.round(sz * 0.22), 'bone', 'center');
+}
+function wrenchIcon(c: CanvasRenderingContext2D, x: number, y: number, sz: number, a: number, rot = -0.7) {
+  c.save(); c.translate(x, y); c.rotate(rot);
+  c.fillStyle = col('bone', a); c.fillRect(-sz * 0.06, -sz * 0.3, sz * 0.12, sz * 0.7);
+  c.beginPath(); c.arc(0, -sz * 0.36, sz * 0.17, 0, TAU); c.fill();
+  c.fillStyle = col('ink', a); c.fillRect(-sz * 0.06, -sz * 0.58, sz * 0.12, sz * 0.22);
+  c.restore();
+}
+
+// ================================================================== BOOT: instrumental intro — spark, traces, title
+function boot(s: S) {
+  const { t, sh, c, g, au } = s;
+  const end = sh.end;
+  const bt = (x: number) => Math.max(0, au.timeOfBeat(Math.round(au.beatAt(x))));
+  const times = [0, bt(1.6), bt(3.0), bt(4.4)];
+  s.bg.glow = 0.2 + 0.35 * prog(t, 2, 8); s.bg.gy = 0.5; s.bg.grid = 0.35 * prog(t, 3, 9); s.bg.stars = 0.5 * prog(t, 1, 6);
+  const k = snapCam(t, times, [{ x: W / 2, y: H / 2, z: 3.2, r: 0.05 }, { x: W / 2, y: H / 2, z: 2.1, r: -0.03 }, { x: W / 2, y: H / 2, z: 1.4, r: 0.015 }, { x: W / 2, y: H / 2, z: 1.0, r: 0 }], 0.7);
+  cam(s, { ...k, z: k.z * (1 + 0.03 * prog(t, 5, end)) });
+  // traces grow out of the spark; signal heads race along them
+  const trs = traces('boot', 11, 30, W / 2, H / 2, 1100, 640);
+  trs.forEach((tr, i) => {
+    const t0 = 0.9 + i * 0.13 + tr.d * 0.4;
+    const kk = prog(t, t0, t0 + 1.8, ease.outCubic);
+    drawTr(c, tr, kk, col('graphite', 0.85), 2.5);
+    const per = 2.2 + tr.d * 1.6, ph = (t - t0) / per;
+    if (kk > 0.3 && t > t0) {
+      const u = ph - Math.floor(ph);
+      head(g, tr.pts, tr.L, u * tr.len * kk, col('signal', 0.9 * (1 - u)), 6);
+      head(c, tr.pts, tr.L, u * tr.len * kk, col('ember', 0.9 * (1 - u)), 3);
+    }
+  });
+  // the spark
+  const kick = au.env('low', t);
+  const sr = (8 + 10 * kick + 6 * prog(t, 0, 2)) * (1 - 0.85 * prog(t, 4.4, 5.0) * (1 - prog(t, end - 0.8, end - 0.1)));
+  c.fillStyle = col('ember', 1); c.beginPath(); c.arc(W / 2, H / 2, sr * 0.6, 0, TAU); c.fill();
+  g.fillStyle = col('signal', 0.8); g.beginPath(); g.arc(W / 2, H / 2, sr * 3, 0, TAU); g.fill();
+  // title: drops in after the pull-back, leaves before the first line
+  const out = prog(t, end - 1.0, end - 0.1, ease.inCubic);
+  if (t > 4.6 && out < 1) {
+    const a = 1 - out;
+    const fa = A(125, 900), fb = A(125, 300);
+    const sa = sizeFor(BRAND.titleA, fa, 1500), sb = sizeFor(BRAND.titleB, fb, 1000);
+    const y0 = H / 2 - 70 - out * 120;
+    band(c, H / 2 + 20, 560, 0.75 * a);
+    drawLetters(c, BRAND.titleA, fa, sa, W / 2 - measure(BRAND.titleA, fa, sa) / 2, y0, bt(5.2), t, (_i, kk) => col('bone', kk * a), { stagger: 0.05, dy: -140, dur: 0.5 });
+    drawLetters(c, BRAND.titleB, fb, sb, W / 2 - measure(BRAND.titleB, fb, sb) / 2, y0 + sb * CAP + 30, bt(6.6), t, (_i, kk) => col('signal', kk * a), { stagger: 0.06, dy: 120, dur: 0.5 });
+    drawLetters(g, BRAND.titleB, fb, sb, W / 2 - measure(BRAND.titleB, fb, sb) / 2, y0 + sb * CAP + 30, bt(6.6), t, (_i, kk) => col('signal', 0.35 * kk * a), { stagger: 0.06, dy: 120, dur: 0.5 });
+    note(c, BRAND.host, W / 2, y0 + sb * CAP + 120, prog(t, bt(8.2), bt(8.2) + 0.5) * a, 40, 'bone', 'center');
+    note(c, BRAND.tagline, W / 2, y0 + sb * CAP + 170, prog(t, bt(9.3), bt(9.3) + 0.5) * a * 0.9, 22, 'ash', 'center');
+  }
+}
+
+// ================================================================== NEURAL: neurons fire on the words, then become circuits
+interface Nd { x: number; y: number; r: number }
+const NEU = new Map<number, { nodes: Nd[]; edges: [number, number][] }>();
+function neurons(seed: number, cx: number, cy: number) {
+  const hit = NEU.get(seed); if (hit) return hit;
+  const r = mulberry32(seed); const nodes: Nd[] = [];
+  for (let i = 0; i < 26; i++) {
+    const a = r() * TAU, d = Math.sqrt(r());
+    nodes.push({ x: cx + Math.cos(a) * d * 940, y: cy + Math.sin(a) * d * 520, r: 5 + r() * 7 });
+  }
+  const edges: [number, number][] = [];
+  nodes.forEach((n, i) => {
+    const near = nodes.map((m, j) => [Math.hypot(m.x - n.x, m.y - n.y), j] as const).filter(([, j]) => j !== i).sort((p, q) => p[0] - q[0]);
+    for (let k = 0; k < 2; k++) { const j = near[k]![1]; if (!edges.some(([a, b]) => (a === j && b === i))) edges.push([i, j]); }
+  });
+  const v = { nodes, edges }; NEU.set(seed, v); return v;
+}
+function edgePts(a: Nd, b: Nd, ortho: number): V2[] {
+  const pts: V2[] = [];
+  const mx = (a.x + b.x) / 2 - (b.y - a.y) * 0.25, my = (a.y + b.y) / 2 + (b.x - a.x) * 0.25;
+  for (let i = 0; i <= 12; i++) {
+    const u = i / 12;
+    const qx = (1 - u) * (1 - u) * a.x + 2 * u * (1 - u) * mx + u * u * b.x, qy = (1 - u) * (1 - u) * a.y + 2 * u * (1 - u) * my + u * u * b.y;
+    const ox = u < 0.5 ? lerp(a.x, b.x, u * 2) : b.x, oy = u < 0.5 ? a.y : lerp(a.y, b.y, (u - 0.5) * 2);
+    pts.push({ x: lerp(qx, ox, ortho), y: lerp(qy, oy, ortho) });
+  }
+  return pts;
+}
+function network(s: S, seed: number, cx: number, cy: number, fires: number[], ortho: number, a = 1) {
+  const { c, g, t } = s;
+  const { nodes, edges } = neurons(seed, cx, cy);
+  edges.forEach(([i, j], e) => {
+    const pts = edgePts(nodes[i]!, nodes[j]!, ortho);
+    const L = polylineLengths(pts);
+    c.strokeStyle = col(ortho > 0.5 ? 'graphite' : 'ash', 0.45 * a); c.lineWidth = ortho > 0.5 ? 3 : 1.6;
+    c.beginPath(); pts.forEach((p, k) => (k ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y))); c.stroke();
+    fires.forEach((f, fi) => {
+      if (hash(e, fi, seed) > 0.4) return;
+      const u = prog(t, f, f + 0.55, ease.outCubic);
+      if (u <= 0 || u >= 1) return;
+      head(g, pts, L, u * last(Array.from(L)), col('signal', 0.95 * a), 7);
+      head(c, pts, L, u * last(Array.from(L)), col('ember', a), 3);
+    });
+  });
+  nodes.forEach((n, i) => {
+    let hot = 0;
+    fires.forEach((f, fi) => { if (hash(i, fi, seed + 1) < 0.35) hot = Math.max(hot, pulse(t, f + 0.3, 0.25)); });
+    c.fillStyle = mix('ash', 'signal', hot, 0.45 * a + 0.4 * hot); c.beginPath(); c.arc(n.x, n.y, n.r * (0.8 + 0.4 * hot), 0, TAU); c.fill();
+    if (hot > 0.05) { g.fillStyle = col('signal', 0.35 * hot * a); g.beginPath(); g.arc(n.x, n.y, n.r * 2.4, 0, TAU); g.fill(); }
+  });
+}
+function neural(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.stars = 0.8; s.bg.glow = 0.35; s.bg.grid = 0.2;
+  const C2 = { x: W / 2 + 1700, y: H / 2 + 380 };
+  const k = snapCam(t, [sh.start, l2 ? l2.start - 0.15 : 1e9], [{ x: W / 2, y: H / 2, z: 1.0, r: -0.01 }, { x: C2.x, y: C2.y, z: 1.0, r: 0.012 }], 0.7, ease.inOutCubic);
+  cam(s, { ...k, z: k.z * (1 + 0.025 * prog(t, sh.start, sh.end)) });
+  const ortho = l2 ? prog(t, l2.start - 0.3, l2.start + 1.0, ease.inOutCubic) : 0;
+  network(s, 3, W / 2, H / 2, l1.words.map((w) => w.start), ortho * 0.6);
+  if (l2) network(s, 5, C2.x, C2.y, l2.words.map((w) => w.start), Math.max(0.5, ortho));
+  // line 1
+  const [r1, r2] = split2(l1, 13);
+  band(c, H / 2, 560, 0.75);
+  row(s, r1, A(100, 900), 1400, 240, W / 2, H / 2 - 110);
+  row(s, r2, A(125, 500), 1150, 150, W / 2, H / 2 + 120);
+  if (!l2) return;
+  // line 2: CIRCUITS WAKE / AND LETTERS LIGHT — LIGHT flickers on like a tube
+  const [q1, q2] = split2(l2, 13);
+  band(c, C2.y, 560, 0.75);
+  row(s, q1, A(125, 900), 1400, 230, C2.x, C2.y - 110);
+  const fam = A(100, 700);
+  const fr = fitRow(q2.map(txt), fam, 1250, 170);
+  q2.forEach((w, i) => {
+    if (/light/i.test(w.w)) {
+      const L = layout(txt(w), fam, fr.size);
+      const x0 = C2.x + fr.xs[i]! - L.width / 2;
+      setFont(c, fam, fr.size); c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+      for (const gl of L.glyphs) {
+        const on = t - (w.start + gl.i * 0.05);
+        if (on < -0.06) continue;
+        const flick = on < 0.25 ? (hash(gl.i, Math.floor(t * 40)) < 0.55 ? 1 : 0.2) : 1;
+        c.fillStyle = col('signal', flick); c.fillText(gl.ch, x0 + gl.x, C2.y + 120 + (CAP * fr.size) / 2);
+        setFont(g, fam, fr.size); g.textAlign = 'left'; g.fillStyle = col('signal', 0.45 * flick); g.fillText(gl.ch, x0 + gl.x, C2.y + 120 + (CAP * fr.size) / 2);
+      }
+    } else word(s, w, txt(w), fam, fr.size, C2.x + fr.xs[i]!, C2.y + 120, { sc: slam(w, t, 1.6) });
+  });
+}
+
+// ================================================================== WIRE: the camera rides the signal along a wire
+function wire(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.2; s.bg.grid = 0.5; s.bg.stars = 0.3;
+  const fam = A(100, 900), size = 190, gap = 150;
+  // wire: along y0, then down a step, then along y1 for line 2
+  const y0 = H / 2 + 60, y1 = y0 + 640;
+  const place = (ws: Word[], x: number) => {
+    const xs: number[] = []; let cx = x;
+    ws.forEach((w, i) => { const m = measure(txt(w), fam, size); if (i) cx += gap; xs.push(cx + m / 2); cx += m; });
+    return { xs, end: cx };
+  };
+  const p1 = place(l1.words, W / 2 - 200);
+  const bendX = p1.end + 260;
+  const p2 = l2 ? place(l2.words, bendX + 360) : { xs: [], end: bendX };
+  const pts: V2[] = [{ x: -600, y: y0 }, { x: bendX, y: y0 }, { x: bendX + 200, y: y1 }, { x: p2.end + 1600, y: y1 }];
+  const L = polylineLengths(pts);
+  const along = (x: number, onLow: boolean) => (onLow ? L[2]! + (x - (bendX + 200)) : x + 600);
+  // camera + signal head targets: every word onset
+  const ws = [...l1.words, ...(l2?.words ?? [])];
+  const tx = [...p1.xs, ...p2.xs];
+  const times = [sh.start, ...ws.map((w) => w.start - 0.05)];
+  const camX = [p1.xs[0]!, ...tx];
+  const camY = [y0, ...l1.words.map(() => y0), ...(l2?.words.map(() => y1) ?? [])];
+  const rr = [0, ...ws.map((_, i) => (i % 2 ? 0.012 : -0.012))];
+  const k = { x: snapVal(t, times, camX, 0.32), y: snapVal(t, times, camY, 0.5, ease.inOutCubic) - 40, z: 1, r: snapVal(t, times, rr, 0.4) };
+  cam(s, k);
+  const hs = [0, ...l1.words.map((_, i) => along(p1.xs[i]!, false)), ...(l2?.words.map((_, i) => along(p2.xs[i]!, true)) ?? [])];
+  hs[0] = along(p1.xs[0]! - 400, false);
+  const hl = snapVal(t, times, hs, 0.3);
+  // wire
+  c.strokeStyle = col('graphite', 1); c.lineWidth = 5; c.lineJoin = 'round';
+  c.beginPath(); pts.forEach((p, i) => (i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y))); c.stroke();
+  const lit = { pts, L, len: last(Array.from(L)), d: 0 };
+  drawTr(c, lit, hl / lit.len, col('signal', 0.9), 5, false);
+  drawTr(g, lit, hl / lit.len, col('signal', 0.35), 12, false);
+  // insulator ticks every 160 px
+  for (let x = -600; x < p2.end + 1600; x += 160) {
+    const onLow = x > bendX + 200, yy = onLow ? y1 : y0;
+    if (x > bendX && x < bendX + 200) continue;
+    c.fillStyle = col('graphite', 1); c.fillRect(x - 3, yy - 12, 6, 24);
+  }
+  const hp = head(g, pts, L, hl, col('ember', 0.9), 22);
+  head(c, pts, L, hl, col('ember', 1), 8);
+  // words sit on the wire
+  l1.words.forEach((w, i) => word(s, w, txt(w), fam, size, p1.xs[i]!, y0 - 150, { sc: slam(w, t, 1.2) }));
+  l2?.words.forEach((w, i) => {
+    const fire = /fire/i.test(w.w);
+    word(s, w, txt(w), fire ? A(125, 900) : fam, size, p2.xs[i]!, y1 - 150, { sc: slam(w, t, fire ? 1.5 : 1.2) });
+    if (fire && t > w.start) {
+      // sparks off the burning word
+      for (let p = 0; p < 40; p++) {
+        const life = 0.9 + hash(p, 3) * 0.8, tt = (t - w.start - hash(p, 7) * 0.5);
+        const u = ((tt % life) + life) % life;
+        if (tt < 0) continue;
+        const vx = (hash(p, 1) - 0.5) * 700, vy = -300 - hash(p, 2) * 500;
+        const x = p2.xs[i]! + (hash(p, 4) - 0.5) * measure('FIRE', A(125, 900), size) + vx * u;
+        const y = y1 - 150 + vy * u + 600 * u * u;
+        g.fillStyle = col(hash(p, 5) < 0.5 ? 'signal' : 'ember', (1 - u / life) * 0.9); g.fillRect(x - 3, y - 3, 6, 6);
+      }
+    }
+  });
+  void hp;
+}
+
+// ================================================================== LEARN: patterns turn on a Truchet grid, a loss curve learns
+function learn(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.grid = 0.6; s.bg.glow = 0.25;
+  const k = snapCam(t, [sh.start, l2 ? l2.start - 0.15 : 1e9], [{ x: W / 2, y: H / 2, z: 1, r: -0.008 }, { x: W / 2, y: H / 2 + 1080, z: 1, r: 0.008 }], 0.65, ease.inOutCubic);
+  cam(s, k);
+  // panel 1: grid on the right
+  const turnW = findW(l1, /turn/i);
+  const spin = springStep(t - turnW.start, 2.4, 0.55) * (t > turnW.start ? 1 : 0);
+  const gx = 1460, gy = H / 2, N = 6, cs = 92;
+  c.save(); c.translate(gx, gy); c.rotate((Math.PI / 2) * clamp(spin, 0, 1.15));
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const id = i * N + j;
+    let rot = Math.floor(hash(id, 1) * 4);
+    let hot = 0;
+    l1.words.forEach((w, wi) => {
+      if (hash(id, wi + 3) < 0.4) { rot += prog(t, w.start - 0.05, w.start + 0.22, ease.outExpo); hot = Math.max(hot, pulse(t, w.start, 0.3)); }
+    });
+    const x = (i - N / 2 + 0.5) * cs, y = (j - N / 2 + 0.5) * cs;
+    c.save(); c.translate(x, y); c.rotate((rot * Math.PI) / 2);
+    c.strokeStyle = mix('graphite', 'signal', hot, 1); c.lineWidth = 6;
+    c.beginPath(); c.arc(-cs / 2, -cs / 2, cs / 2, 0, Math.PI / 2); c.stroke();
+    c.beginPath(); c.arc(cs / 2, cs / 2, cs / 2, Math.PI, Math.PI * 1.5); c.stroke();
+    if (hot > 0.1) { g.strokeStyle = col('signal', 0.5 * hot); g.lineWidth = 10; g.save(); g.setTransform(c.getTransform()); g.beginPath(); g.arc(-cs / 2, -cs / 2, cs / 2, 0, Math.PI / 2); g.stroke(); g.restore(); }
+    c.restore();
+  }
+  c.restore();
+  const [r1, r2] = split2(l1, 12);
+  row(s, r1, A(100, 900), 900, 210, 620, H / 2 - 100);
+  row(s, r2, A(125, 700), 900, 170, 620, H / 2 + 110);
+  if (!l2) return;
+  // panel 2: a loss curve that learns, tests tick off, then LEARN
+  const Y = H / 2 + 1080;
+  const x0 = 180, x1 = 960, yb = Y + 260, yt = Y - 260;
+  rule(c, x0, yb, x1, yb, prog(t, l2.start - 0.2, l2.start + 0.4, ease.outExpo), col('ash', 0.8), 3);
+  rule(c, x0, yb, x0, yt, prog(t, l2.start - 0.2, l2.start + 0.4, ease.outExpo), col('ash', 0.8), 3);
+  note(c, 'LOSS', x0 + 10, yt - 16, prog(t, l2.start, l2.start + 0.3), 20, 'ash');
+  note(c, 'EPOCHS →', x1, yb + 40, prog(t, l2.start, l2.start + 0.3), 20, 'ash', 'right');
+  const pk = prog(t, l2.start, last(l2.words).start + 0.3, ease.linear);
+  c.strokeStyle = col('signal', 1); c.lineWidth = 5; c.beginPath();
+  const n = 60;
+  for (let i = 0; i <= n * pk; i++) {
+    const u = i / n, x = lerp(x0, x1, u), y = lerp(yb - 30, yt, Math.exp(-u * 3.2)) + noise1(u * 18, 4) * 26 * (1 - u);
+    if (i === 0) c.moveTo(x, yb - (yb - yt) * 0.95 + noise1(0, 4) * 26); else c.lineTo(x, y);
+  }
+  c.stroke();
+  l2.words.forEach((w, i) => {
+    const a = prog(t, w.start, w.start + 0.2);
+    if (a <= 0) return;
+    note(c, `TEST ${String(i + 1).padStart(2, '0')}  ✓ PASS`, x0 + 40, yt + 40 + i * 34, a, 20, i === l2.words.length - 1 ? 'signal' : 'bone');
+  });
+  const [q1, q2] = split2(l2, 14);
+  row(s, q1, A(100, 900), 820, 200, 1400, Y - 110);
+  row(s, q2, A(125, 700), 820, 180, 1400, Y + 110);
+}
+
+// ================================================================== PROMPT: a terminal types, the line draws a plan; an arm builds
+function prompt(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.grid = 0.4; s.bg.glow = 0.3;
+  const OX = 1920 + 200;
+  const k = snapCam(t, [sh.start, l2 ? l2.start - 0.15 : 1e9], [{ x: W / 2, y: H / 2, z: 1, r: 0 }, { x: W / 2 + OX, y: H / 2, z: 1, r: -0.015 }], 0.6, ease.inOutCubic);
+  cam(s, k);
+  // terminal
+  const tx0 = 300, tx1 = W - 300, ty0 = 120, ty1 = 280;
+  c.fillStyle = col('ink2', 0.95); c.fillRect(tx0, ty0, tx1 - tx0, ty1 - ty0);
+  c.strokeStyle = col('graphite', 1); c.lineWidth = 2; c.strokeRect(tx0, ty0, tx1 - tx0, ty1 - ty0);
+  ['ash', 'ash', 'signal'].forEach((k2, i) => { c.fillStyle = col(k2, 0.8); c.beginPath(); c.arc(tx0 + 28 + i * 26, ty0 + 24, 7, 0, TAU); c.fill(); });
+  let typed = '';
+  for (const w of l1.words) {
+    const n = clean(w.w).length;
+    const kk = clamp((t - w.start) / Math.max(0.12, w.end - w.start));
+    if (kk <= 0) break;
+    typed += clean(w.w).toLowerCase().slice(0, Math.ceil(n * kk)) + ' ';
+  }
+  note(c, '> ' + typed + (Math.floor(t * 3) % 2 ? '▍' : ''), tx0 + 30, ty0 + 110, 1, 44, 'bone');
+  // the plan drawn from the prompt
+  const plan = findW(l1, /plan/i);
+  const pk = prog(t, plan.start - 0.05, plan.start + 1.2, ease.outCubic);
+  if (pk > 0) {
+    const px = W / 2 - 560, py = 560, pw = 1120, ph = 440;
+    rule(c, W / 2, ty1, W / 2, py, prog(pk, 0, 0.2), col('signal', 0.7), 3);
+    c.strokeStyle = col('signal', 0.45); c.lineWidth = 3;
+    const seg = (x0: number, y0: number, x1: number, y1: number, a: number, b: number) => rule(c, x0, y0, x1, y1, prog(pk, a, b), col('signal', 0.45), 3);
+    seg(px, py, px + pw, py, 0.15, 0.4); seg(px + pw, py, px + pw, py + ph, 0.3, 0.5); seg(px + pw, py + ph, px, py + ph, 0.4, 0.65); seg(px, py + ph, px, py, 0.55, 0.75);
+    seg(px + pw * 0.42, py, px + pw * 0.42, py + ph, 0.6, 0.85); seg(px + pw * 0.42, py + ph * 0.55, px + pw, py + ph * 0.55, 0.7, 0.95);
+    note(c, 'PLAN · A-101', px + pw - 10, py + ph + 34, prog(pk, 0.8, 1), 18, 'signal', 'right');
+  }
+  const [r1, r2] = split2(l1, 15);
+  row(s, r1, A(100, 900), 1300, 200, W / 2, 470);
+  row(s, r2, A(125, 900), 1300, 200, W / 2, 720, { hot: 'signal' });
+  if (!l2) return;
+  // line 2: an arm draws the underline as the line is sung; TOOL hands it a wrench
+  const cx = W / 2 + OX;
+  const [q1, q2] = split2(l2, 14);
+  row(s, q1, A(100, 900), 1300, 200, cx, 260);
+  const fr = row(s, q2, A(125, 700), 1300, 170, cx, 500)!;
+  const xsT = l2.words.map((w) => { const i2 = q2.indexOf(w); return i2 >= 0 ? cx + fr.xs[i2]! : cx - fr.width / 2; });
+  const times = [l2.start - 0.15, ...l2.words.map((w) => w.start)];
+  const ex = snapVal(t, times, [cx - fr.width / 2 - 60, ...xsT], 0.35, ease.inOutCubic);
+  const ey = 640 + 18 * Math.sin(t * 9) * prog(t, l2.start, l2.end);
+  const B = { x: cx + 700, y: 1020 };
+  const l1n = 520, l2n = 470;
+  const dx = ex - B.x, dy = ey - B.y, d = Math.min(l1n + l2n - 1, Math.hypot(dx, dy));
+  const a2 = Math.acos(clamp((d * d - l1n * l1n - l2n * l2n) / (2 * l1n * l2n), -1, 1));
+  const a1 = Math.atan2(dy, dx) - Math.atan2(l2n * Math.sin(a2), l1n + l2n * Math.cos(a2));
+  const J = { x: B.x + Math.cos(a1) * l1n, y: B.y + Math.sin(a1) * l1n };
+  const E = { x: J.x + Math.cos(a1 + a2) * l2n, y: J.y + Math.sin(a1 + a2) * l2n };
+  rule(c, cx - fr.width / 2 - 60, 640, Math.max(cx - fr.width / 2 - 60, E.x), 640, 1, col('signal', 0.95), 6);
+  rule(g, cx - fr.width / 2 - 60, 640, Math.max(cx - fr.width / 2 - 60, E.x), 640, 1, col('signal', 0.4), 12);
+  c.strokeStyle = col('bone', 0.9); c.lineCap = 'round';
+  c.lineWidth = 38; c.beginPath(); c.moveTo(B.x, B.y); c.lineTo(J.x, J.y); c.stroke();
+  c.lineWidth = 26; c.beginPath(); c.moveTo(J.x, J.y); c.lineTo(E.x, E.y); c.stroke();
+  c.strokeStyle = col('ink', 1); c.lineWidth = 4;
+  [B, J].forEach((p) => { c.fillStyle = col('ink2', 1); c.beginPath(); c.arc(p.x, p.y, 26, 0, TAU); c.fill(); c.stroke(); });
+  c.fillStyle = col('graphite', 1); c.fillRect(B.x - 90, B.y, 180, 60);
+  const tool = findW(l2, /tool/i);
+  if (t > tool.start - 0.05) wrenchIcon(c, E.x + 10, E.y - 40, 110 * clamp(springStep(t - tool.start, 3, 0.5), 0, 1.1), 1, -0.4 + 0.3 * Math.sin(t * 6));
+  g.fillStyle = col('signal', 0.8); g.beginPath(); g.arc(E.x, E.y, 18, 0, TAU); g.fill();
+}
+
+// ================================================================== ZOOM: into the O of ZOOM, then widen out; trace through the doubt
+function zoom(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  const n = sh.o.n ?? 1, flip = n % 2 ? 1 : -1;
+  s.bg.grid = 0.3; s.bg.stars = 0.4; s.bg.glow = 0.3;
+  const zw = l1.words[0]!;
+  const rightW = l1.words[1] ?? zw, thenW = l1.words.find((w) => /then/i.test(w.w)) ?? last(l1.words);
+  const widen = findW(l1, /widen/i), outW = last(l1.words);
+  const famZ = A(125, 900), sz = sizeFor('ZOOM', famZ, 1450);
+  const L = layout('ZOOM', famZ, sz);
+  const zx0 = W / 2 - L.width / 2;
+  const og = L.glyphs[2]!;
+  const O = { x: zx0 + og.x + og.w / 2, y: H / 2 - 20 };
+  const R2 = { x: W / 2, y: H / 2 + 2600 };
+  const times = [sh.start, rightW.start - 0.12, thenW.start - 0.1, outW.start, l2 ? l2.start - 0.2 : 1e9];
+  const k = snapCam(t, times, [
+    { x: W / 2, y: H / 2, z: 1, r: 0 }, { x: O.x, y: O.y, z: 7.5, r: 0.04 * flip }, { x: W / 2, y: H / 2 + 260, z: 0.44, r: -0.02 * flip },
+    { x: W / 2, y: H / 2 + 260, z: 0.4, r: 0 }, { x: R2.x, y: R2.y, z: 1, r: 0 },
+  ], 0.55, ease.inOutExpo);
+  cam(s, k);
+  // the circuit board around ZOOM (revealed when widening out)
+  const trs = traces('zoom' + n, 20 + n, 36, W / 2, H / 2, 2400, 1500);
+  const wk = prog(t, thenW.start - 0.1, thenW.start + 1.2, ease.outCubic);
+  trs.forEach((tr, i) => {
+    drawTr(c, tr, wk * (0.6 + 0.4 * tr.d), col('graphite', 0.9), 8);
+    if (wk > 0.5) { const u = ((t * 0.4 + tr.d) % 1); head(g, tr.pts, tr.L, u * tr.len, col('signal', 0.7), 16); }
+    void i;
+  });
+  // ZOOM
+  word(s, zw, 'ZOOM', famZ, sz, W / 2, H / 2 - 20, { sc: slam(zw, t, 1.5) });
+  // inside the O: a chip with RIGHT IN on it
+  if (t > rightW.start - 0.3) {
+    const a = prog(t, rightW.start - 0.3, rightW.start);
+    c.strokeStyle = col('signal', 0.8 * a); c.lineWidth = 0.6;
+    c.strokeRect(O.x - 46, O.y - 34, 92, 68);
+    for (let i = 0; i < 6; i++) { const yy = O.y - 28 + i * 11; rule(c, O.x - 46, yy, O.x - 56, yy, a, col('signal', 0.8), 0.6); rule(c, O.x + 46, yy, O.x + 56, yy, a, col('signal', 0.8), 0.6); }
+    const inner = l1.words.slice(1, l1.words.indexOf(thenW));
+    const fr = fitRow(inner.map(txt), A(100, 900), 76, 22);
+    inner.forEach((w, i) => word(s, w, txt(w), A(100, 900), fr.size, O.x + fr.xs[i]!, O.y, { sc: slam(w, t, 1.5) }));
+  }
+  // THEN WIDEN OUT, huge on the board
+  const tail = l1.words.slice(l1.words.indexOf(thenW));
+  if (t > thenW.start - 0.2) {
+    const fam = A(100, 900);
+    // lay the row out with WIDEN at its widest so it never grows into its neighbours or past the frame
+    const wfam = A(125, 900), widths = tail.map((w) => measure(txt(w), w === widen ? wfam : fam, 100));
+    const gapEm = 0.3, tot = widths.reduce((x, y) => x + y, 0) + gapEm * 100 * (tail.length - 1);
+    const size = Math.min(380, (100 * 3300) / tot), kk2 = size / 100;
+    const fr = { size, xs: [] as number[] }; let xx = (-tot * kk2) / 2;
+    widths.forEach((m) => { fr.xs.push(xx + (m * kk2) / 2); xx += m * kk2 + gapEm * size; });
+    tail.forEach((w, i) => {
+      const f = w === widen ? widthFam(prog(t, w.start, w.start + 0.6, ease.outCubic)) : fam;
+      word(s, w, txt(w), f, fr.size, W / 2 + fr.xs[i]!, H / 2 + 720, { sc: slam(w, t, 1.4) });
+    });
+  }
+  if (!l2) return;
+  // line 2: two rows of type; a trace snakes between them and lights each word as it is sung; DOUBT glitches until reached
+  const [q1, q2] = split2(l2);
+  const famT = A(100, 900);
+  const f1 = fitRow(q1.map(txt), famT, 1450, 190), f2 = fitRow(q2.map(txt), A(125, 900), 1450, 190);
+  const yT = R2.y - 330, yB = R2.y + 330;
+  const anc: V2[] = [...q1.map((_, i) => ({ x: R2.x + f1.xs[i]!, y: R2.y - 150 })), ...q2.map((_, i) => ({ x: R2.x + f2.xs[i]!, y: R2.y + 150 }))];
+  const P: V2[] = [{ x: anc[0]!.x - 300, y: anc[0]!.y }];
+  anc.forEach((p, i) => { const q = P[P.length - 1]!; if (i && q.y !== p.y) P.push({ x: q.x, y: p.y }); P.push(p); });
+  const PL = polylineLengths(P);
+  const tot = last(Array.from(PL));
+  const aL = anc.map((p) => PL[P.indexOf(p)]!);
+  const ws = l2.words;
+  const hl = snapVal(t, [l2.start - 0.2, ...ws.map((w) => w.start - 0.05)], [0, ...aL], 0.32);
+  c.strokeStyle = col('graphite', 1); c.lineWidth = 6; c.beginPath(); P.forEach((p, i) => (i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y))); c.stroke();
+  drawTr(c, { pts: P, L: PL, len: tot, d: 0 }, hl / tot, col('signal', 1), 6, false);
+  drawTr(g, { pts: P, L: PL, len: tot, d: 0 }, hl / tot, col('signal', 0.4), 14, false);
+  anc.forEach((p, i) => { const on = t >= ws[i]!.start; c.fillStyle = col(on ? 'signal' : 'graphite', 1); c.beginPath(); c.arc(p.x, p.y, on ? 12 : 8, 0, TAU); c.fill(); rule(c, p.x, p.y, p.x, i < q1.length ? yT + 100 : yB - 100, 1, col('graphite', 0.8), 2); });
+  head(g, P, PL, hl, col('ember', 0.9), 18); head(c, P, PL, hl, col('ember', 1), 7);
+  ws.forEach((w, i) => {
+    const top = i < q1.length;
+    const x = R2.x + (top ? f1.xs[i]! : f2.xs[i - q1.length]!);
+    const doubt = /doubt/i.test(w.w), reached = t >= w.start;
+    const jit = doubt && !reached ? noise1(t * 30, 2) * 12 : 0;
+    word(s, w, txt(w), top ? famT : A(125, 900), top ? f1.size : f2.size, x + jit, top ? yT : yB, { sc: slam(w, t, 1.4), ghost: doubt ? 0.3 : 0, base: doubt && !reached ? 'ash' : 'bone' });
+    if (doubt && !reached) note(c, '? ? ?', x, yB + 110, 0.5 + 0.3 * noise1(t * 9, 1), 30, 'ash', 'center');
+  });
+}
+
+// ================================================================== EDGE: a corridor of doors; the map ends at the frontier
+function edge(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  const n = sh.o.n ?? 1;
+  s.bg.glow = 0.4; s.bg.gy = 0.45;
+  screen(s);
+  const a1 = until(t, l2);
+  if (a1 > 0) {
+    // doors: depth advances on every word onset
+    const steps = l1.words.map((w) => w.start - 0.05);
+    const cd = snapVal(t, [sh.start, ...steps], [0, ...steps.map((_, i) => (i + 1) * 0.55)], 0.35, ease.outCubic);
+    for (let i = 9; i >= 0; i--) {
+      const z = 1.0 + i * 0.75 - cd;
+      if (z < 0.18) continue;
+      const sc = 1 / z, al = clamp((z - 0.18) * 3) * clamp(2.6 - z * 0.45) * a1;
+      const dw = 520 * sc, dh = 900 * sc, x = W / 2 - dw / 2, y = H / 2 - dh / 2 + 60 * sc;
+      c.strokeStyle = col(i % 2 ? 'ash' : 'bone', 0.7 * al); c.lineWidth = Math.max(1.5, 8 * sc);
+      c.strokeRect(x, y, dw, dh);
+      const open = 0.15 + 0.1 * Math.sin(i * 1.7 + n);
+      g.fillStyle = col('signal', 0.25 * al); g.fillRect(x + dw * (1 - open), y, dw * open, dh);
+      c.fillStyle = col('signal', 0.6 * al); c.fillRect(x + dw * (1 - open), y, Math.max(1, 3 * sc), dh);
+      note(c, '?', x + dw * 0.45, y + dh * 0.55, al * 0.8, Math.max(8, Math.round(150 * sc)), 'ash', 'center');
+    }
+    band(c, 190, 300, 0.8 * a1); band(c, 890, 300, 0.8 * a1);
+    const [r1, r2] = split2(l1, 16);
+    row(s, r1, A(100, 900), 1500, 170, W / 2, 190, { alpha: a1 });
+    row(s, r2, A(125, 900), 1300, 190, W / 2, 890, { alpha: a1 });
+  }
+  if (!l2) return;
+  // the edge of the known map: a floor grid that stops at a glowing boundary, stars beyond
+  const k2 = prog(t, l2.start - 0.15, l2.start + 0.5, ease.outCubic);
+  if (k2 <= 0) return;
+  s.bg.stars = 1.2 * k2; s.bg.grid = 0;
+  const tilt = snapVal(t, [l2.start - 0.15, findW(l2, /edge/i).start, findW(l2, /ask/i).start], [-260, 0, 40], 0.6, ease.inOutCubic);
+  const ey = 640 + tilt;
+  c.save(); c.globalAlpha = k2;
+  // grid on the near side of the edge
+  for (let i = -14; i <= 14; i++) { c.strokeStyle = col('graphite', 0.8); c.lineWidth = 2; c.beginPath(); c.moveTo(W / 2 + i * 40, ey); c.lineTo(W / 2 + i * 260, H + 200); c.stroke(); }
+  for (let j = 0; j < 10; j++) { const yy = ey + Math.pow(j / 10, 1.8) * (H + 200 - ey) + ((t * 60) % 30) * (j / 10); c.strokeStyle = col('graphite', 0.6); c.beginPath(); c.moveTo(-100, yy); c.lineTo(W + 100, yy); c.stroke(); }
+  c.restore();
+  const ek = prog(t, findW(l2, /edge/i).start - 0.05, findW(l2, /edge/i).start + 0.4, ease.outExpo);
+  rule(c, W / 2 - 960 * ek, ey, W / 2 + 960 * ek, ey, 1, col('signal', 1), 5);
+  rule(g, W / 2 - 960 * ek, ey, W / 2 + 960 * ek, ey, 1, col('signal', 0.6), 16);
+  note(c, '← THE KNOWN', 140, ey + 50, ek * k2, 22, 'ash');
+  note(c, 'THE FRONTIER →', W - 140, ey - 24, ek * k2, 22, 'signal', 'right');
+  // FIND THE EDGE sits on the edge; AND ASK FOR MORE above, MORE grows letter by letter
+  const ei = l2.words.indexOf(findW(l2, /edge/i));
+  const head1 = l2.words.slice(0, ei + 1), tail = l2.words.slice(ei + 1);
+  row(s, head1, A(100, 900), 1300, 170, W / 2, ey - 90);
+  const more = last(tail);
+  const pre = tail.slice(0, -1);
+  const famM = A(125, 900);
+  const fr = fitRow([...pre.map(txt), 'MORE'], A(100, 700), 1050, 140);
+  pre.forEach((w, i) => word(s, w, txt(w), A(100, 700), fr.size, W / 2 + fr.xs[i]!, 200, { sc: slam(w, t, 1.5) }));
+  if (more && t > more.start - 0.06) {
+    const sizes = [1, 1.18, 1.36, 1.56].map((m) => fr.size * m);
+    let x = W / 2 + last(fr.xs) - measure('MORE', A(100, 700), fr.size) / 2;
+    'MORE'.split('').forEach((ch, i) => {
+      const kk = prog(t, more.start + i * 0.07, more.start + i * 0.07 + 0.3, ease.outExpo);
+      const sz2 = sizes[i]!;
+      if (kk > 0) word(s, more, ch, famM, sz2, x + measure(ch, famM, sz2) / 2, 200 + (CAP * (sz2 - fr.size)) / 2 * 0 , { sc: kk, glow: 1 });
+      x += measure(ch, famM, sz2) + 4;
+    });
+  }
+}
+
+// ================================================================== CHORUS: hook (FRONTIER FRIDAY over the growing city)
+function hook(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const n = Math.min(4, sh.o.n ?? 1), v = sh.o.v ?? 0;
+  const [fw, fr, ...rest] = l.words as [Word, Word, ...Word[]];
+  s.bg.glow = 0.55 + 0.1 * n; s.bg.gy = 0.82; s.bg.grid = 0.5; s.bg.stars = 0.6;
+  // world: the city along the bottom (the camera rides along it)
+  const k = v === 0
+    ? { x: W / 2 + 120 * prog(t, sh.start, sh.end), y: H / 2, z: 1, r: 0 }
+    : snapCam(t, [sh.start, fw.start - 0.05], [{ x: W / 2 + 800, y: H / 2 + 200, z: 1.35, r: -0.1 }, { x: W / 2 + 300, y: H / 2, z: 1, r: 0 }], 0.8, ease.inOutCubic);
+  cam(s, k);
+  drawCity(s, n, H - 30, { lit: 0.3 + 0.12 * n, rise: prog(t, sh.start, sh.start + 1.4, ease.outCubic), xs: [k.x - 1700, k.x + 1700] });
+  screen(s);
+  band(c, H / 2 - 80, 700, 0.6);
+  const fa = A(125, 900), fb = A(125, 300);
+  const sa = sizeFor('FRONTIER', fa, 1560), sb = sizeFor('FRIDAY', fb, 1100);
+  const yA = H / 2 - 190, yB = yA + sa * CAP / 2 + 30 + sb * CAP / 2;
+  const slideA = v === 1 ? lerp(-900, 0, prog(t, fw.start - 0.1, fw.start + 0.35, ease.outExpo)) : 0;
+  const slideB = v === 1 ? lerp(900, 0, prog(t, fr.start - 0.1, fr.start + 0.35, ease.outExpo)) : 0;
+  if (v === 0) {
+    drawLetters(c, 'FRONTIER', fa, sa, W / 2 - measure('FRONTIER', fa, sa) / 2, yA + (CAP * sa) / 2, fw.start - 0.06, t, (_i, kk) => mix('bone', 'signal', heat(fw, t), kk), { stagger: 0.025, dy: -120, dur: 0.3 });
+  } else word(s, fw, 'FRONTIER', fa, sa, W / 2 + slideA, yA, { sc: slam(fw, t, 1.2) });
+  word(s, fr, 'FRIDAY', fb, sb, W / 2 + slideB, yB, { sc: v === 0 ? slam(fr, t, 1.6) : 1, base: 'signal', hot: 'ember' });
+  if (t > fr.start) { setFont(g, fb, sb); g.textAlign = 'center'; g.fillStyle = col('signal', 0.25 * appear(fr, t)); g.fillText('FRIDAY', W / 2 + slideB, yB + (CAP * sb) / 2); }
+  if (rest.length) {
+    const yC = yB + sb * CAP / 2 + 110;
+    row(s, rest, A(62, 900), 760, 120, W / 2, yC, { from: 1.4 });
+    const gk = prog(t, last(rest).start, last(rest).start + 0.4, ease.outExpo);
+    rule(c, W / 2 - 520, yC + 80, W / 2 - 520 + 1040 * gk, yC + 80, 1, col('signal', 0.9), 4);
+  }
+  note(c, `CHORUS 0${Math.min(n, 3)} · CITY STAGE ${n}`, W - 120, H - 60, 0.6 * prog(t, sh.start, sh.start + 0.4), 18, 'ash', 'right');
+}
+
+// ================================================================== EARL: with Earl Co (plain letterforms) · watch ideas GROW
+function earl(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const wi = ws.findIndex((w) => /^watch$/i.test(clean(w.w)));
+  const name = ws.slice(0, wi > 0 ? wi : 3), rest = ws.slice(name.length);
+  const grow = last(rest.length ? rest : ws);
+  const mid = rest.slice(0, -1);
+  s.bg.glow = 0.55; s.bg.gy = 0.75; s.bg.stars = 0.5;
+  const k = snapCam(t, [sh.start, (rest[0] ?? grow).start - 0.1], [{ x: W / 2, y: H / 2 - 30, z: 1, r: 0.01 }, { x: W / 2, y: H / 2 + 30, z: 1, r: -0.006 }], 0.6, ease.inOutCubic);
+  cam(s, k);
+  // "with" small, EARL CO big — ordinary letterforms, no glyph tricks
+  const withW = name.filter((w) => /^with$/i.test(clean(w.w))), nm = name.filter((w) => !/^with$/i.test(clean(w.w)));
+  withW.forEach((w) => word(s, w, 'WITH', A(100, 500), 70, W / 2, 150, { sc: slam(w, t, 1.4) }));
+  row(s, nm, A(100, 900), 1100, 250, W / 2, 330);
+  row(s, mid, A(125, 500), 1000, 120, W / 2, 560);
+  // GROW grows up out of its baseline, with vines
+  if (grow && t > grow.start - 0.06) {
+    const fam = A(125, 900), sz = 240, base = 900;
+    const sy = clamp(lerp(0.15, 1, springStep(t - grow.start, 2.2, 0.5)), 0.1, 1.12);
+    const h = heat(grow, t);
+    const draw = (ctx: CanvasRenderingContext2D, f: string) => { ctx.save(); ctx.translate(W / 2, base); ctx.scale(1, sy); setFont(ctx, fam, sz); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = f; ctx.fillText('GROW', 0, 0); ctx.restore(); };
+    draw(c, mix('bone', 'signal', Math.max(h, 0.35)));
+    draw(g, col('signal', 0.3 * Math.max(h, 0.4)));
+    const wv = prog(t, grow.start, grow.start + 1.6, ease.outCubic);
+    const gwid = measure('GROW', fam, sz);
+    [-1, 1].forEach((side) => {
+      c.strokeStyle = col('acid', 0.9); c.lineWidth = 5; c.beginPath();
+      const x0 = W / 2 + side * (gwid / 2 + 30);
+      for (let i = 0; i <= 40 * wv; i++) {
+        const u = i / 40, x = x0 + side * Math.sin(u * 7) * 40 * u, y = base - u * 520;
+        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+        if (i % 8 === 4) { c.save(); c.fillStyle = col('acid', 0.9); c.translate(x, y); c.rotate(side * 0.8); c.beginPath(); c.ellipse(side * 18, 0, 20, 9, 0, 0, TAU); c.fill(); c.restore(); }
+      }
+      c.stroke();
+    });
+  }
+}
+
+// ================================================================== MORPH: bricks to blocks, and code to keys
+function morph(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const andI = ws.findIndex((w) => /^and$/i.test(clean(w.w)));
+  const r1 = andI > 0 ? ws.slice(0, andI) : ws.slice(0, 3), r2 = andI > 0 ? ws.slice(andI) : ws.slice(3);
+  s.bg.grid = 0.5; s.bg.glow = 0.35;
+  const Y1 = 620, Y2 = 1400;
+  const k = snapCam(t, [sh.start, (r2[0] ?? last(ws)).start - 0.1], [{ x: W / 2, y: Y1 - 100, z: 1, r: -0.012 }, { x: W / 2, y: Y2 - 100, z: 1, r: 0.012 }], 0.55, ease.inOutCubic);
+  cam(s, k);
+  const small = (w: Word) => /^(to|and)$/i.test(clean(w.w));
+  const lay = (rw: Word[], y: number) => {
+    const fam = A(100, 900);
+    const fr = fitRow(rw.map(txt), fam, 1560, 240);
+    rw.forEach((w, i) => {
+      word(s, w, txt(w), fam, fr.size, W / 2 + fr.xs[i]!, y, { sc: slam(w, t, small(w) ? 1.3 : 1.8) * (small(w) ? 0.55 : 1), base: small(w) ? 'ash' : 'bone' });
+      if (small(w)) return;
+      const ik = clamp(springStep(t - w.start, 3, 0.5), 0, 1.1);
+      if (t < w.start - 0.05) return;
+      const ix = W / 2 + fr.xs[i]!, iy = y - 300, isz = 170 * ik;
+      const nm = clean(w.w).toLowerCase();
+      if (nm.startsWith('brick')) brickIcon(c, ix, iy, isz, 1);
+      else if (nm.startsWith('block')) blockIcon(c, g, ix, iy, isz, 1, '#' + Math.floor(hash(sh.n, 3) * 9000 + 1000));
+      else if (nm.startsWith('code')) codeIcon(c, ix, iy, isz, 1);
+      else if (nm.startsWith('key')) keyIcon(c, ix, iy, isz, 1, -0.2 + 0.2 * Math.sin(t * 3));
+    });
+    // arrows on "to": from the previous icon to the next
+    rw.forEach((w, i) => {
+      if (!/^to$/i.test(clean(w.w)) || i === 0 || i + 1 >= rw.length) return;
+      const ak = prog(t, w.start - 0.05, w.start + 0.35, ease.outExpo);
+      const xa = W / 2 + fr.xs[i - 1]! + 120, xb = W / 2 + fr.xs[i + 1]! - 120;
+      rule(c, xa, y - 300, lerp(xa, xb, ak), y - 300, 1, col('signal', 0.9), 4);
+      rule(g, xa, y - 300, lerp(xa, xb, ak), y - 300, 1, col('signal', 0.4), 10);
+      if (ak > 0.9) { c.fillStyle = col('signal', 1); c.beginPath(); c.moveTo(xb, y - 300); c.lineTo(xb - 20, y - 312); c.lineTo(xb - 20, y - 288); c.fill(); }
+    });
+  };
+  lay(r1, Y1); lay(r2, Y2);
+}
+
+// ================================================================== TOMORROW: built tile by tile, piece by piece
+function tomorrow(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const tw = findW(l, /tomorrow/i);
+  const ti = ws.indexOf(tw);
+  const pre = ws.slice(0, ti), post = ws.slice(ti + 1);
+  s.bg.grid = 0.8; s.bg.glow = 0.3;
+  cam(s, { x: W / 2, y: H / 2, z: 1 + 0.03 * prog(t, sh.start, sh.end), r: -0.006 });
+  row(s, pre, A(100, 900), 700, 160, W / 2, 190);
+  const fam = A(125, 900), sz = sizeFor('TOMORROW', fam, 1500);
+  const Lt = layout('TOMORROW', fam, sz);
+  const x0 = W / 2 - Lt.width / 2, yb = H / 2 + (CAP * sz) / 2 + 10;
+  const tEnd = Math.max(tw.start + 0.8, (last(post.length ? post : ws).start) + 0.15);
+  setFont(c, fam, sz); c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+  Lt.glyphs.forEach((gl) => {
+    const arr = lerp(tw.start - 0.05, tEnd, gl.i / (Lt.glyphs.length - 1));
+    const k = prog(t, arr - 0.3, arr, ease.outCubic);
+    const tx = x0 + gl.x, ty = yb;
+    // ghost slot
+    c.strokeStyle = col('graphite', 0.9); c.lineWidth = 2; c.setLineDash([8, 8]);
+    c.strokeRect(tx - 4, ty - CAP * sz - 10, gl.w + 8, CAP * sz + 20); c.setLineDash([]);
+    if (k <= 0) return;
+    const sx = tx + (hash(gl.i, 2) - 0.5) * 1400 * (1 - k), sy = ty - (500 + hash(gl.i, 5) * 300) * (1 - k);
+    c.save(); c.translate(sx + gl.w / 2, sy); c.rotate((hash(gl.i, 9) - 0.5) * 1.6 * (1 - k));
+    const hot = pulse(t, arr, 0.25);
+    c.fillStyle = mix('bone', 'signal', hot); setFont(c, fam, sz); c.fillText(gl.ch, -gl.w / 2, 0);
+    c.strokeStyle = col('acid', 0.9 * (1 - k * 0.7)); c.lineWidth = 3; c.strokeRect(-gl.w / 2 - 4, -CAP * sz - 10, gl.w + 8, CAP * sz + 20);
+    if (hot > 0.05) { g.fillStyle = col('signal', 0.35 * hot); g.fillRect(-gl.w / 2 - 4, -CAP * sz - 10, gl.w + 8, CAP * sz + 20); g.save(); g.restore(); }
+    c.restore();
+    if (hot > 0.05) { g.fillStyle = col('signal', 0.3 * hot); g.fillRect(tx - 4, ty - CAP * sz - 10, gl.w + 8, CAP * sz + 20); }
+  });
+  // PIECE BY PIECE with a build bar
+  row(s, post, A(100, 700), 900, 110, W / 2, 860);
+  const bk = prog(t, tw.start, tEnd, ease.linear);
+  for (let i = 0; i < 8; i++) {
+    const on = bk * 8 > i + 0.5;
+    c.fillStyle = col(on ? 'signal' : 'graphite', on ? 0.95 : 0.6); c.fillRect(W / 2 - 400 + i * 102, 960, 90, 16);
+  }
+  note(c, `BUILD ${Math.round(bk * 100)}%`, W / 2 + 430, 976, 0.8, 18, 'ash');
+}
+
+// ================================================================== CITY: AI · TECH on the rooftops, the city glows (pan)
+function city(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const n = Math.min(4, sh.o.n ?? 1);
+  const ws = l.words;
+  const theI = ws.findIndex((w) => /^the$/i.test(clean(w.w)));
+  const signs = ws.slice(0, theI > 0 ? theI : 2), tail = ws.slice(signs.length);
+  const glow = last(ws);
+  s.bg.glow = 0.5 + 0.4 * appear(glow, t); s.bg.gy = 0.85; s.bg.stars = 0.8;
+  const gy = 1000;
+  const xs = [W / 2, ...signs.map((_, i) => W / 2 + 700 * (i + 1)), W / 2 + 700 * (signs.length + 1)];
+  const times = [sh.start, ...signs.map((w) => w.start - 0.1), (tail[0] ?? glow).start - 0.1];
+  const k = { x: snapVal(t, times, xs, 0.55, ease.inOutCubic), y: H / 2 + snapVal(t, times, [60, ...signs.map(() => 0), -40], 0.55), z: snapVal(t, times, [1.1, ...signs.map(() => 1), 0.82], 0.6, ease.inOutCubic), r: snapVal(t, times, [0.02, ...signs.map((_, i) => (i % 2 ? 0.015 : -0.015)), 0], 0.5) };
+  cam(s, k);
+  const lit = lerp(0.2, 0.9, prog(t, sh.start, glow.start + 0.3)) + 0.4 * appear(glow, t);
+  drawCity(s, Math.max(n, 2), gy, { lit, xs: [k.x - 2600, k.x + 2600] });
+  // rooftop neon signs
+  signs.forEach((w, i) => {
+    if (t < w.start - 0.1) return;
+    const sx = xs[i + 1]!, sy = 470;
+    const fam = A(125, 900), sz = 170;
+    const m = measure(txt(w), fam, sz);
+    c.strokeStyle = col('graphite', 1); c.lineWidth = 6;
+    c.beginPath(); c.moveTo(sx - m / 3, sy + 90); c.lineTo(sx - m / 3, gy - 380); c.moveTo(sx + m / 3, sy + 90); c.lineTo(sx + m / 3, gy - 380); c.stroke();
+    c.strokeStyle = col('signal', 0.9 * appear(w, t)); c.lineWidth = 4; c.strokeRect(sx - m / 2 - 40, sy - 110, m + 80, 210);
+    word(s, w, txt(w), fam, sz, sx, sy, { sc: slam(w, t, 1.6), hot: 'signal', glow: 1.5 });
+    g.strokeStyle = col('signal', 0.4 * appear(w, t)); g.lineWidth = 12; g.strokeRect(sx - m / 2 - 40, sy - 110, m + 80, 210);
+  });
+  // THE CITIES GLOW in screen space once the camera pulls back
+  screen(s);
+  band(c, 160, 280, 0.6 * appear(tail[0] ?? glow, t));
+  row(s, tail, A(100, 900), 1500, 170, W / 2, 160, { from: 1.4 });
+}
+
+// ================================================================== FLOW: crypto moving, the letters ride the current
+function flow(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const letI = ws.findIndex((w) => /^let$/i.test(clean(w.w)));
+  const head2 = letI > 0 ? ws.slice(0, letI) : ws.slice(0, 2), tail = ws.slice(head2.length);
+  s.bg.glow = 0.35; s.bg.grid = 0.3;
+  const rr = snapVal(t, [sh.start, ...ws.map((w) => w.start)], [0, ...ws.map((_, i) => (i % 2 ? 0.018 : -0.018))], 0.4);
+  cam(s, { x: W / 2, y: H / 2, z: 1, r: rr });
+  const yC = 720;
+  const curve = (x: number, k: number) => yC + Math.sin(x * 0.0042 + t * 1.6 + k * 0.9) * (60 + 18 * k) + k * 26 - 52;
+  for (let k = 0; k < 5; k++) {
+    c.strokeStyle = col(k === 2 ? 'signal' : 'graphite', k === 2 ? 0.8 : 0.7); c.lineWidth = k === 2 ? 4 : 2;
+    c.beginPath(); for (let x = -40; x <= W + 40; x += 20) { const y = curve(x, k); if (x < -30) c.moveTo(x, y); else c.lineTo(x, y); } c.stroke();
+    if (k === 2) { g.strokeStyle = col('signal', 0.3); g.lineWidth = 12; g.beginPath(); for (let x = -40; x <= W + 40; x += 20) { const y = curve(x, k); if (x < -30) g.moveTo(x, y); else g.lineTo(x, y); } g.stroke(); }
+  }
+  // tokens riding the strands
+  for (let i = 0; i < 14; i++) {
+    const k = i % 5, sp = 220 + hash(i, 1) * 200;
+    const x = ((hash(i, 2) * (W + 200) + t * sp) % (W + 200)) - 100;
+    const y = curve(x, k);
+    const r = 20 + hash(i, 3) * 10;
+    c.strokeStyle = col('acid', 0.9); c.lineWidth = 3; c.beginPath();
+    for (let j = 0; j < 6; j++) { const a = (j / 6) * TAU + t; const px = x + Math.cos(a) * r, py = y + Math.sin(a) * r; if (j) c.lineTo(px, py); else c.moveTo(px, py); }
+    c.closePath(); c.fillStyle = col('ink', 1); c.fill(); c.stroke();
+    note(c, '◆', x, y + 6, 0.9, 16, 'acid', 'center');
+  }
+  // CRYPTO big; MOVING with motion streaks
+  const famA = A(125, 900);
+  const fr = fitRow(head2.map(txt), famA, 1500, 230);
+  head2.forEach((w, i) => {
+    const moving = /moving/i.test(w.w);
+    const x = W / 2 + fr.xs[i]!;
+    if (moving && t > w.start) for (let j = 3; j >= 1; j--) word(s, null, txt(w), famA, fr.size, x - j * 46 * (1 - prog(t, w.start, w.start + 0.6)), 300, { color: col('signal', 0.12 * (4 - j)) });
+    word(s, w, txt(w), famA, fr.size, x, 300, { sc: slam(w, t, 1.6) });
+  });
+  // LET IT FLOW: glyphs placed along the main strand
+  const fam = A(100, 900), sz = 150;
+  const text = tail.map(txt).join(' ');
+  const Lt = layout(text, fam, sz);
+  const xs0 = W / 2 - Lt.width / 2;
+  let ci = 0;
+  const starts: number[] = [];
+  tail.forEach((w) => { for (let i = 0; i < txt(w).length; i++) starts.push(w.start); starts.push(w.start); });
+  setFont(c, fam, sz); c.textAlign = 'center'; c.textBaseline = 'alphabetic';
+  for (const gl of Lt.glyphs) {
+    const st = starts[ci++] ?? last(ws).start;
+    const a = prog(t, st - 0.06, st + 0.2, ease.outExpo);
+    if (a <= 0 || gl.ch === ' ') continue;
+    const x = xs0 + gl.x + gl.w / 2;
+    const y = curve(x, 2) - 30;
+    const ang = Math.atan2(curve(x + 4, 2) - curve(x - 4, 2), 8);
+    const h = pulse(t, st, 0.3);
+    c.save(); c.translate(x, y + (1 - a) * 80); c.rotate(ang); setFont(c, fam, sz); c.fillStyle = mix('bone', 'signal', h, a); c.fillText(gl.ch, 0, 0); c.restore();
+    if (h > 0.05) { g.save(); g.translate(x, y); g.rotate(ang); setFont(g, fam, sz); g.textAlign = 'center'; g.fillStyle = col('signal', 0.4 * h); g.fillText(gl.ch, 0, 0); g.restore(); }
+  }
+}
+
+// ================================================================== FUTURE: a road to the horizon, FUTURE widens (holds through gaps)
+function future(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const n = Math.min(4, sh.o.n ?? 1);
+  const ws = l.words;
+  const fw = findW(l, /future/i);
+  const fi = ws.indexOf(fw);
+  const pre = ws.slice(0, fi), post = ws.slice(fi + 1);
+  const hold = prog(t, last(ws).end + 0.6, sh.end, ease.linear);
+  s.bg.glow = 0.7 + 0.2 * (n === 4 ? 1 : 0); s.bg.gx = 0.5; s.bg.gy = 0.6; s.bg.stars = 1;
+  // world: road to the vanishing point, the city small on the horizon; the camera pushes in over the hold
+  const hz = 620;
+  cam(s, { x: W / 2, y: hz - 160, z: 1 + 0.25 * hold + 0.03 * prog(t, sh.start, last(ws).end), r: 0 });
+  c.save(); c.translate(0, 80);
+  drawCity(s, n, hz - 80 + 0, { lit: 0.6, scale: 0.35, xs: [-200, W + 200], a: 0.9 });
+  c.restore();
+  // translate leaves the city slightly lower; road below the horizon
+  const vp = { x: W / 2, y: hz };
+  c.strokeStyle = col('bone', 0.6); c.lineWidth = 3;
+  rule(c, -400, hz, W + 400, hz, 1, col('bone', 0.5), 2);
+  [-1, 1].forEach((sd) => { c.beginPath(); c.moveTo(vp.x + sd * 20, vp.y); c.lineTo(vp.x + sd * 1400, H + 300); c.stroke(); });
+  for (let i = 0; i < 12; i++) {
+    const u = ((i / 12 + t * 0.35) % 1), d = Math.pow(u, 2.2);
+    const y = lerp(hz, H + 300, d), w = lerp(2, 40, d), h = lerp(2, 90, d);
+    c.fillStyle = col('signal', 0.8 * d + 0.1); c.fillRect(vp.x - w / 2, y, w, h);
+  }
+  g.fillStyle = col('signal', 0.18); g.beginPath(); g.ellipse(vp.x, hz, 900, 40, 0, 0, TAU); g.fill();
+  // type in screen space
+  screen(s);
+  band(c, 360, 640, 0.55);
+  row(s, pre, A(100, 500), 700, 90, W / 2, 140);
+  if (t > fw.start - 0.06) {
+    const kk = prog(t, fw.start - 0.05, fw.start + 0.8, ease.outCubic);
+    const fam = widthFam(kk, 900);
+    const sz = sizeFor('FUTURE', A(125, 900), 1520);
+    word(s, fw, 'FUTURE', fam, sz, W / 2, 380, { sc: slam(fw, t, 1.3) });
+  }
+  band(c, 890, 240, 0.65);
+  row(s, post, A(100, 800), 900, 120, W / 2, 890);
+  note(c, `${BRAND.titleA} ${BRAND.titleB}`, W / 2, 1000, prog(t, last(ws).end + 1.5, last(ws).end + 2.2) * (1 - prog(t, sh.end - 0.4, sh.end)), 22, 'ash', 'center');
+}
+
+// ================================================================== PLAN (paper): blueprint lines become a street; walls rise on the beat
+function plan(s: S) {
+  const { t, sh, c, au } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  const ink = (a: number) => col('blood', a);
+  const k2 = l2 ? prog(t, l2.start - 0.2, l2.start + 0.6, ease.inOutCubic) : 0;
+  cam(s, { x: W / 2 + 60 * k2, y: H / 2 - 40 * k2, z: 1 + 0.05 * k2, r: -0.035 * k2 });
+  const w1 = l1.words;
+  const at = (i: number) => w1[Math.min(i, w1.length - 1)]!.start;
+  // lots, road, dimensions — drawn as the line is sung
+  const roadY0 = 560, roadY1 = 760;
+  rule(c, 160, roadY0, W - 160, roadY0, prog(t, at(0) - 0.1, at(1) + 0.3, ease.outCubic), ink(0.9), 4);
+  rule(c, 160, roadY1, W - 160, roadY1, prog(t, at(1) - 0.1, at(2) + 0.3, ease.outCubic), ink(0.9), 4);
+  const st = findW(l1, /street/i);
+  const dk = prog(t, st.start - 0.1, st.start + 0.6, ease.outCubic);
+  for (let x = 200; x < W - 200; x += 120) rule(c, x, (roadY0 + roadY1) / 2, x + 60, (roadY0 + roadY1) / 2, dk, col('acid', 0.9), 6);
+  const lots = 5, lw = (W - 400) / lots;
+  for (let i = 0; i < lots; i++) {
+    const x = 200 + i * lw + 14, y = 320, w = lw - 28, h = 210;
+    const lk = prog(t, at(1) + i * 0.08, at(1) + i * 0.08 + 0.4, ease.outCubic);
+    c.strokeStyle = ink(0.8); c.lineWidth = 2.5; c.setLineDash([]);
+    if (lk > 0) { c.beginPath(); c.moveTo(x, y + h); c.lineTo(x, y + h - h * lk); c.lineTo(x + w * lk, y + h - h * lk); c.stroke(); rule(c, x, y + h, x + w, y + h, lk, ink(0.8), 2.5); rule(c, x + w, y + h, x + w, y + h - h * lk, lk, ink(0.8), 2.5); }
+    note(c, `LOT ${i + 1}`, x + 8, y + 26, lk, 16, 'blood');
+    // walls rise on line 2, one course of bricks per beat
+    if (l2 && t > l2.start - 0.1) {
+      const rk = prog(t, findW(l2, /raise/i).start + i * 0.06, findW(l2, /walls/i).start + 0.4 + i * 0.06, ease.outExpo);
+      const wh = 200 * rk;
+      c.fillStyle = col('bone', 0.9); c.fillRect(x, y + h - wh, w, wh);
+      c.strokeStyle = ink(1); c.lineWidth = 3; c.strokeRect(x, y + h - wh, w, wh);
+      // shading for depth
+      c.fillStyle = ink(0.15); c.beginPath(); c.moveTo(x + w, y + h - wh); c.lineTo(x + w + 30, y + h - wh - 22); c.lineTo(x + w + 30, y + h - 22); c.lineTo(x + w, y + h); c.fill();
+      const beatW = findW(l2, /beat/i);
+      const b0 = au.beatAt(findW(l2, /lay/i).start - 0.05);
+      const courses = clamp(Math.floor(au.beatAt(t) - b0) + 1, 0, 6) * (t > findW(l2, /lay/i).start - 0.05 ? 1 : 0);
+      for (let r = 0; r < courses; r++) for (let b = 0; b < 4; b++) {
+        const bx = x + 6 + b * (w - 12) / 4 + ((r % 2) * (w - 12)) / 8, by = y + h - 18 - r * 22;
+        if (bx + (w - 12) / 4 - 6 > x + w) continue;
+        c.fillStyle = col('acid', 0.85 + 0.15 * pulse(t, beatW.start, 0.3)); c.fillRect(bx, by, (w - 12) / 4 - 6, 16);
+      }
+    }
+  }
+  note(c, 'SHEET A-101 · STREET PLAN · SCALE 1:200', 200, 820, prog(t, at(0), at(0) + 0.5), 18, 'blood');
+  rule(c, 200, 850, W - 200, 850, prog(t, at(2), at(2) + 0.5), ink(0.6), 1.5);
+  note(c, `${Math.round((W - 400) / 8)}'-0"`, W / 2, 878, prog(t, at(2), at(2) + 0.5), 16, 'blood', 'center');
+  // type: screen space
+  screen(s);
+  const a1 = until(t, l2);
+  const ia = l1.words.indexOf(findW(l1, /become/i));
+  const top = ia > 0 ? l1.words.slice(0, ia) : l1.words.slice(0, 2), bot = l1.words.slice(top.length);
+  row(s, top, A(100, 900), 1300, 170, W / 2, 170, { alpha: a1 });
+  row(s, bot, A(125, 900), 1000, 120, W / 2, (roadY0 + roadY1) / 2 - 4, { alpha: a1 });
+  if (!l2) return;
+  const andI = l2.words.findIndex((w) => /^and$/i.test(clean(w.w)));
+  const q1 = andI > 0 ? l2.words.slice(0, andI) : l2.words.slice(0, 3), q2 = l2.words.slice(q1.length);
+  row(s, q1, A(100, 900), 1300, 170, W / 2, 170);
+  row(s, q2, A(125, 900), 1200, 150, W / 2, 940);
+}
+
+// ================================================================== UNLOCK: the key turns, the lift climbs a floor, people fill it
+function unlock(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.4; s.bg.grid = 0.3; s.bg.stars = 0.4;
+  const floorW = findW(l1, /floor/i), unW = findW(l1, /unlock/i), keyW = l1.words[0]!;
+  const FH = 420, bx0 = 520, bx1 = 1400;
+  const fy = (f: number) => 900 - f * FH; // floor line of storey f
+  const camY = snapVal(t, [sh.start, floorW.start - 0.35], [fy(0) - FH / 2, fy(1) - FH / 2], 0.8, ease.inOutCubic);
+  cam(s, { x: W / 2, y: camY, z: 1, r: 0 });
+  // building section
+  for (let f = -1; f < 3; f++) {
+    c.strokeStyle = col('bone', 0.8); c.lineWidth = 6;
+    c.beginPath(); c.moveTo(bx0, fy(f)); c.lineTo(bx1, fy(f)); c.stroke();
+    c.lineWidth = 4; c.beginPath(); c.moveTo(bx0, fy(f)); c.lineTo(bx0, fy(f + 1)); c.moveTo(bx1, fy(f)); c.lineTo(bx1, fy(f + 1)); c.stroke();
+    note(c, `FLOOR ${String(f + 1).padStart(2, '0')}`, bx0 + 20, fy(f) - 20, 0.7, 18, 'ash');
+  }
+  // lift shaft + car
+  const sx = bx1 - 150;
+  c.strokeStyle = col('graphite', 1); c.lineWidth = 3; c.strokeRect(sx, fy(2), 130, fy(-1) - fy(2));
+  const carY = snapVal(t, [sh.start, floorW.start - 0.35], [fy(0), fy(1)], 0.8, ease.inOutCubic);
+  c.fillStyle = col('ink2', 1); c.fillRect(sx + 10, carY - FH + 40, 110, FH - 50);
+  c.strokeStyle = col('signal', 0.9); c.strokeRect(sx + 10, carY - FH + 40, 110, FH - 50);
+  g.fillStyle = col('signal', 0.2); g.fillRect(sx + 10, carY - FH + 40, 110, FH - 50);
+  const fl = t > floorW.start - 0.35 ? '02' : '01';
+  note(c, `▲ ${fl}`, sx + 65, carY - FH + 90, 1, 26, 'signal', 'center');
+  // the key in the lock on the ground floor
+  const lockX = bx0 + 300, lockY = fy(0) - FH / 2;
+  const ins = prog(t, keyW.start - 0.1, keyW.start + 0.4, ease.outExpo);
+  const turn = prog(t, unW.start, unW.start + 0.35, ease.outBack);
+  c.fillStyle = col('ink2', 1); c.strokeStyle = col('bone', 0.9); c.lineWidth = 4;
+  c.beginPath(); c.arc(lockX, lockY, 70, 0, TAU); c.fill(); c.stroke();
+  c.fillStyle = col('ink', 1); c.beginPath(); c.arc(lockX, lockY - 12, 14, 0, TAU); c.fill(); c.fillRect(lockX - 6, lockY - 12, 12, 40);
+  c.save(); c.translate(lockX - 160 * (1 - ins) - 70, lockY); c.scale(1, lerp(1, 0.25, Math.sin(turn * Math.PI / 2)));
+  keyIcon(c, -60, 0, 340, ins, 0, 'acid'); c.restore();
+  if (turn > 0.5) { g.fillStyle = col('signal', 0.5 * pulse(t, unW.start + 0.2, 0.4)); g.beginPath(); g.arc(lockX, lockY, 120, 0, TAU); g.fill(); }
+  // people fill the upper floor on line 2
+  if (l2) {
+    const ppl = 7;
+    for (let i = 0; i < ppl; i++) {
+      const w = l2.words[Math.min(l2.words.length - 1, Math.floor((i / ppl) * l2.words.length))]!;
+      const a = prog(t, w.start - 0.05, w.start + 0.25, ease.outExpo);
+      if (a <= 0) continue;
+      const px = bx0 + 90 + i * 100, py = fy(1);
+      c.fillStyle = col(i % 3 === 0 ? 'acid' : 'bone', 0.9 * a);
+      c.beginPath(); c.arc(px, py - 170 - (1 - a) * 40, 24, 0, TAU); c.fill();
+      c.beginPath(); c.roundRect(px - 30, py - 140 - (1 - a) * 40, 60, 140, 24); c.fill();
+    }
+    const warm = prog(t, l2.start, l2.end, ease.outCubic);
+    g.fillStyle = col('acid', 0.12 * warm); g.fillRect(bx0, fy(2), bx1 - bx0 - 160, FH);
+  }
+  // type: screen space
+  screen(s);
+  const a1 = until(t, l2);
+  const ui = l1.words.indexOf(unW);
+  band(c, 160, 280, 0.75); band(c, 920, 260, 0.75);
+  row(s, l1.words.slice(0, ui + 1), A(125, 900), 1300, 200, W / 2, 160, { alpha: a1 });
+  row(s, l1.words.slice(ui + 1), A(100, 900), 1200, 150, W / 2, 920, { alpha: a1 });
+  if (!l2) return;
+  const hi = l2.words.findIndex((w) => /house/i.test(w.w));
+  const q1 = l2.words.slice(0, hi + 1), q2 = l2.words.slice(hi + 1);
+  row(s, q1, A(100, 900), 1400, 170, W / 2, 160);
+  const mr = last(q2);
+  const fr = fitRow(q2.map(txt), A(125, 900), 1100, 190);
+  q2.forEach((w, i) => word(s, w, txt(w), A(125, 900), fr.size, W / 2 + fr.xs[i]!, 920, { sc: slam(w, t, w === mr ? 2.2 : 1.6) }));
+}
+
+// ================================================================== SKYLINE (instrumental): fly down the avenue of the grown city
+function skyline(s: S) {
+  const { t, sh, c, g, au } = s;
+  const lt = t - sh.start, dur = sh.end - sh.start;
+  s.bg.glow = 0.6; s.bg.gy = 0.55; s.bg.stars = 1; s.bg.grid = 0;
+  const bar = au.barAt(t);
+  const bank = snapVal(t, [sh.start, ...[1, 2, 3, 4, 5, 6, 7, 8].map((b) => au.timeOfBeat(Math.round(au.beatAt(sh.start + b * dur / 9))))], [0, 0.05, -0.04, 0.06, 0, -0.06, 0.03, -0.02, 0], 0.9, ease.inOutCubic);
+  const alt = snapVal(t, [sh.start, sh.start + dur * 0.3, sh.start + dur * 0.6], [0, 260, 80], 1.6, ease.inOutCubic);
+  screen(s);
+  c.save(); c.translate(W / 2, H / 2); c.rotate(bank); c.translate(-W / 2, -H / 2);
+  g.save(); g.translate(W / 2, H / 2); g.rotate(bank); g.translate(-W / 2, -H / 2);
+  const hz = H / 2 - 40 + alt * 0.5, f = 700;
+  const camZ = lt * 900, camYh = 300 + alt; // camera height above street
+  // street + centre signal
+  c.fillStyle = col('ink', 0.85); c.beginPath(); c.moveTo(W / 2 - 4, hz); c.lineTo(W / 2 + 4, hz); c.lineTo(W / 2 + 2600, H + 400); c.lineTo(W / 2 - 2600, H + 400); c.fill();
+  for (let i = 0; i < 40; i++) {
+    const z = 200 + i * 300 - (camZ % 300);
+    const y = hz + (camYh * f) / z;
+    const w = (30 * f) / z;
+    if (y > H + 50) continue;
+    c.fillStyle = col('signal', clamp(1.4 - z / 6000)); c.fillRect(W / 2 - w / 2, y, w, (90 * f) / z);
+  }
+  // buildings, far to near
+  const spacing = 520;
+  const first = Math.floor(camZ / spacing);
+  for (let i = first + 24; i >= first; i--) {
+    for (const side of [-1, 1]) {
+      const seed = i * 2 + (side > 0 ? 1 : 0);
+      const z = i * spacing - camZ + 260;
+      if (z < 60) continue;
+      const bw = 300 + hash(seed, 1) * 300, bh = 500 + hash(seed, 2) * 1600, bx = side * (520 + hash(seed, 3) * 200);
+      const sc = f / z;
+      const x0 = W / 2 + (bx - (side < 0 ? bw : 0)) * sc, x1 = x0 + bw * sc;
+      const yb = hz + camYh * sc, yt = yb - bh * sc;
+      const fog = clamp(1.2 - z / 12000);
+      c.fillStyle = col('ink2', fog); c.fillRect(x0, yt, x1 - x0, yb - yt);
+      c.strokeStyle = col('graphite', fog); c.lineWidth = Math.max(1, 3 * sc); c.strokeRect(x0, yt, x1 - x0, yb - yt);
+      // facade windows
+      const cols = 5, rws = Math.min(40, Math.floor(bh / 70));
+      for (let a = 0; a < cols; a++) for (let b = 0; b < rws; b++) {
+        if (hash(seed, a, b) > 0.55 + 0.25 * Math.sin(bar * 0.5 + seed)) continue;
+        const wx = x0 + ((a + 0.25) / cols) * (x1 - x0), wy = yt + (b * 70 + 30) * sc;
+        c.fillStyle = col('acid', 0.8 * fog); c.fillRect(wx, wy, ((x1 - x0) / cols) * 0.5, 26 * sc);
+      }
+      if (hash(seed, 7) < 0.25) { g.fillStyle = col('signal', 0.6 * fog * (Math.floor(t * 2 + seed) % 2)); g.beginPath(); g.arc((x0 + x1) / 2, yt - 10 * sc, 10 * sc + 2, 0, TAU); g.fill(); }
+    }
+  }
+  c.restore(); g.restore();
+  // brand lockup mid-flight, then the street turns into a chain of blocks
+  const la = prog(t, sh.start + dur * 0.32, sh.start + dur * 0.38) * (1 - prog(t, sh.start + dur * 0.62, sh.start + dur * 0.68));
+  if (la > 0) {
+    band(c, H / 2, 420, 0.6 * la);
+    const fa = A(125, 900), sa = sizeFor('FRONTIER FRIDAY', fa, 1500);
+    drawLetters(c, 'FRONTIER FRIDAY', fa, sa, W / 2 - measure('FRONTIER FRIDAY', fa, sa) / 2, H / 2 + (CAP * sa) / 2 - 30, sh.start + dur * 0.32, t, (i, k) => col(i > 8 ? 'signal' : 'bone', k * la), { stagger: 0.03, dy: -60 });
+    note(c, BRAND.host, W / 2, H / 2 + 110, la, 38, 'bone', 'center');
+  }
+  const ck = prog(t, sh.end - 4.2, sh.end - 0.4, ease.linear);
+  if (ck > 0) {
+    for (let i = 0; i < 6; i++) {
+      const a = prog(ck, i / 6, i / 6 + 0.2, ease.outExpo);
+      if (a <= 0) continue;
+      const bx = 230 + i * 260, by = 900;
+      c.fillStyle = col('ink2', 0.95 * a); c.fillRect(bx, by - 70, 200, 140);
+      c.strokeStyle = col('signal', a); c.lineWidth = 3; c.strokeRect(bx, by - 70, 200, 140);
+      note(c, `#${String(1000 + i * 7).padStart(4, '0')}`, bx + 100, by - 20, a, 22, 'signal', 'center');
+      note(c, '0x' + Math.floor(hash(i, 5) * 0xffffff).toString(16).padStart(6, '0'), bx + 100, by + 30, a * 0.8, 18, 'ash', 'center');
+      if (i) rule(c, bx - 60, by, bx, by, a, col('signal', 0.9), 4);
+    }
+  }
+}
+
+// ================================================================== CHAIN: hash by hash the blocks align; nodes connect across the line
+function chain(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.grid = 0.4; s.bg.glow = 0.35;
+  const alignW = findW(l1, /align/i);
+  const drops = l1.words.filter((w) => !/^(by|the)$/i.test(clean(w.w))).slice(0, 4);
+  const toNet = l2 ? prog(t, l2.start - 0.2, l2.start + 0.8, ease.inOutCubic) : 0;
+  cam(s, { x: W / 2 + 30 * prog(t, sh.start, sh.end), y: H / 2, z: 1 - 0.06 * toNet, r: 0.01 * (1 - toNet) });
+  const al = clamp(springStep(t - alignW.start + 0.05, 2.6, 0.55), 0, 1.1) * (t > alignW.start - 0.05 ? 1 : 0);
+  const netPos = [[-560, -150], [-420, 200], [420, -200], [560, 170]];
+  const pos: V2[] = [];
+  drops.forEach((w, i) => {
+    const a = prog(t, w.start - 0.08, w.start + 0.3, ease.outExpo);
+    const bx = W / 2 + (i - 1.5) * 390, by = H / 2 + 20;
+    const mx = bx + (hash(i, 1) - 0.5) * 140 * (1 - al), my = by + (hash(i, 2) - 0.5) * 180 * (1 - al) - (1 - a) * 500;
+    const rot = (hash(i, 3) - 0.5) * 0.4 * (1 - al);
+    const nx = W / 2 + netPos[i]![0]!, ny = H / 2 + 20 + netPos[i]![1]!;
+    const x = lerp(mx, nx, toNet), y = lerp(my, ny, toNet);
+    pos.push({ x, y });
+    if (a <= 0) return;
+    const bw = lerp(300, 120, toNet), bh = lerp(200, 120, toNet), rad = lerp(10, 60, toNet);
+    c.save(); c.translate(x, y); c.rotate(rot);
+    c.fillStyle = col('ink2', 0.95 * a); c.strokeStyle = col('signal', a); c.lineWidth = 4;
+    c.beginPath(); c.roundRect(-bw / 2, -bh / 2, bw, bh, rad); c.fill(); c.stroke();
+    if (toNet < 0.5) {
+      note(c, `BLOCK #${String(418 + i).padStart(4, '0')}`, 0, -40, a * (1 - toNet * 2), 20, 'ash', 'center');
+      note(c, '0x' + Math.floor(hash(i, 9) * 0xffffff).toString(16).padStart(6, '0') + '…', 0, 4, a * (1 - toNet * 2), 26, 'signal', 'center');
+      note(c, i ? `prev 0x${Math.floor(hash(i - 1, 9) * 0xffffff).toString(16).padStart(6, '0')}` : 'genesis', 0, 50, a * (1 - toNet * 2), 16, 'ash', 'center');
+    }
+    c.restore();
+    g.strokeStyle = col('signal', 0.3 * a * (pulse(t, w.start, 0.3) + al * 0.5)); g.lineWidth = 10; g.strokeRect(x - bw / 2, y - bh / 2, bw, bh);
+  });
+  // chain links once aligned
+  if (al > 0.2 && toNet < 1) for (let i = 1; i < pos.length; i++) {
+    const a = pos[i - 1]!, b = pos[i]!;
+    const lk = prog(t, alignW.start + i * 0.08, alignW.start + 0.3 + i * 0.08, ease.outExpo) * (1 - toNet);
+    c.strokeStyle = col('signal', lk); c.lineWidth = 6; c.beginPath(); c.ellipse(lerp(a.x, b.x, 0.5), lerp(a.y, b.y, 0.5), 34, 16, 0, 0, TAU); c.stroke();
+  }
+  // line 2: nodes connect across a dashed line
+  if (l2) {
+    const lk = prog(t, l2.start, l2.start + 0.4);
+    c.setLineDash([16, 14]); rule(c, W / 2, 280, W / 2, 820, lk, col('ash', 0.8), 3); c.setLineDash([]);
+    const pairs = [[0, 2], [1, 3], [0, 3], [1, 2], [0, 1], [2, 3]];
+    pairs.forEach(([a, b], i) => {
+      const w = l2.words[Math.min(l2.words.length - 1, i)]!;
+      const k = prog(t, w.start - 0.05, w.start + 0.35, ease.outExpo);
+      if (k <= 0 || !pos[a!] || !pos[b!]) return;
+      const A0 = pos[a!]!, B0 = pos[b!]!;
+      rule(c, A0.x, A0.y, B0.x, B0.y, k, col('signal', 0.9), 4);
+      rule(g, A0.x, A0.y, B0.x, B0.y, k, col('signal', 0.35), 10);
+    });
+  }
+  // type (screen space)
+  screen(s);
+  const a1 = until(t, l2);
+  const ti = l1.words.findIndex((w) => /^the$/i.test(clean(w.w)));
+  row(s, l1.words.slice(0, ti > 0 ? ti : 3), A(100, 900), 1300, 180, W / 2, 170, { alpha: a1 });
+  row(s, l1.words.slice(ti > 0 ? ti : 3), A(125, 900), 1300, 160, W / 2, 920, { alpha: a1 });
+  if (!l2) return;
+  const ai = l2.words.findIndex((w) => /across/i.test(w.w));
+  row(s, l2.words.slice(0, ai > 0 ? ai : 2), A(100, 900), 1300, 180, W / 2, 170);
+  row(s, l2.words.slice(ai > 0 ? ai : 2), A(125, 700), 1300, 160, W / 2, 920);
+}
+
+// ================================================================== VOTE: ballots weigh on a scale; choose the path, the day rises
+function vote(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.4; s.bg.grid = 0.3; s.bg.stars = 0.4;
+  const a1 = until(t, l2);
+  const voices = findW(l1, /voices/i), weigh = findW(l1, /weigh/i);
+  screen(s);
+  if (a1 > 0) {
+    // balance
+    const tilt = t > weigh.start - 0.05 ? 0.16 * clamp(springStep(t - weigh.start, 1.8, 0.35), 0, 1.3) : 0.04 * Math.sin(t * 2.5) * prog(t, voices.start, voices.start + 0.3);
+    const px = W / 2, py = 420;
+    c.save(); c.globalAlpha = a1;
+    c.strokeStyle = col('bone', 0.9); c.lineWidth = 8;
+    c.beginPath(); c.moveTo(px, py); c.lineTo(px, 760); c.stroke(); c.fillStyle = col('bone', 0.9); c.fillRect(px - 110, 760, 220, 14);
+    const arm = 460;
+    const L0 = { x: px - Math.cos(tilt) * arm, y: py - Math.sin(tilt) * arm }, R0 = { x: px + Math.cos(tilt) * arm, y: py + Math.sin(tilt) * arm };
+    c.beginPath(); c.moveTo(L0.x, L0.y); c.lineTo(R0.x, R0.y); c.stroke();
+    [L0, R0].forEach((p, side) => {
+      c.lineWidth = 2; c.strokeStyle = col('ash', 0.9);
+      c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(p.x - 110, p.y + 180); c.moveTo(p.x, p.y); c.lineTo(p.x + 110, p.y + 180); c.stroke();
+      c.lineWidth = 6; c.strokeStyle = col('bone', 0.9); c.beginPath(); c.moveTo(p.x - 130, p.y + 180); c.lineTo(p.x + 130, p.y + 180); c.stroke();
+      // ballots stacking in the pans
+      const cnt = side ? 7 : 4;
+      for (let i = 0; i < cnt; i++) {
+        const w = l1.words[Math.min(l1.words.length - 1, Math.floor((i / cnt) * 2))]!;
+        const fk = prog(t, w.start + i * 0.07, w.start + i * 0.07 + 0.45, ease.outCubic);
+        if (fk <= 0) continue;
+        const bx = p.x - 90 + (i % 4) * 52, by = p.y + 160 - Math.floor(i / 4) * 34;
+        const sx = bx + (hash(i, side) - 0.5) * 900 * (1 - fk), sy = by - 700 * (1 - fk);
+        c.fillStyle = col('bone', 0.95); c.fillRect(sx, sy - 26, 44, 28);
+        note(c, '✓', sx + 22, sy - 4, 1, 20, 'blood', 'center');
+      }
+    });
+    g.fillStyle = col('signal', 0.6 * pulse(t, weigh.start, 0.3)); g.beginPath(); g.arc(px, py, 24, 0, TAU); g.fill();
+    c.restore();
+    band(c, 150, 260, 0.7 * a1); band(c, 930, 230, 0.7 * a1);
+    const vi = l1.words.indexOf(voices);
+    row(s, l1.words.slice(0, vi > 0 ? vi : 2), A(100, 900), 1300, 180, W / 2, 150, { alpha: a1 });
+    row(s, l1.words.slice(vi > 0 ? vi : 2), A(125, 900), 1200, 160, W / 2, 930, { alpha: a1 });
+  }
+  if (!l2) return;
+  // a fork: one branch lights, the day rises at its end
+  const pathW = findW(l2, /path/i), dayW = last(l2.words);
+  const k = snapCam(t, [l2.start - 0.15, pathW.start, dayW.start - 0.2], [{ x: W / 2, y: H / 2, z: 1, r: 0 }, { x: W / 2 + 120, y: H / 2 - 40, z: 1.08, r: 0.02 }, { x: W / 2 + 260, y: H / 2 - 80, z: 1.16, r: 0 }], 0.8, ease.inOutCubic);
+  cam(s, k);
+  const fork = { x: W / 2, y: 640 };
+  const Lb = { x: W / 2 - 520, y: 330 }, Rb = { x: W / 2 + 520, y: 330 };
+  const rk = prog(t, l2.start - 0.1, l2.start + 0.5, ease.outCubic);
+  c.lineCap = 'round';
+  [[{ x: W / 2, y: H + 60 }, fork], [fork, Lb], [fork, Rb]].forEach(([p, q]) => rule(c, p!.x, p!.y, q!.x, q!.y, rk, col('graphite', 1), 26));
+  const pk = prog(t, pathW.start - 0.05, pathW.start + 0.6, ease.outCubic);
+  const P: V2[] = [{ x: W / 2, y: H + 60 }, fork, Rb];
+  const PL = polylineLengths(P);
+  drawTr(c, { pts: P, L: PL, len: last(Array.from(PL)), d: 0 }, pk, col('signal', 1), 10, false);
+  drawTr(g, { pts: P, L: PL, len: last(Array.from(PL)), d: 0 }, pk, col('signal', 0.4), 26, false);
+  if (pk > 0 && pk < 1) head(g, P, PL, pk * last(Array.from(PL)), col('ember', 1), 22);
+  const sk = prog(t, dayW.start - 0.1, dayW.start + 0.9, ease.outCubic);
+  if (sk > 0) {
+    c.save(); c.beginPath(); c.rect(0, 0, W * 2, Rb.y); c.clip();
+    c.fillStyle = col('signal', 0.9); c.beginPath(); c.arc(Rb.x, Rb.y + 110 - 150 * sk, 110, 0, TAU); c.fill(); c.restore();
+    g.fillStyle = col('signal', 0.5 * sk); g.beginPath(); g.arc(Rb.x, Rb.y - 40 * sk, 220, 0, TAU); g.fill();
+    for (let i = 0; i < 9; i++) { const a = Math.PI + (i + 0.5) * (Math.PI / 9); rule(c, Rb.x + Math.cos(a) * 150, Rb.y + Math.sin(a) * 150, Rb.x + Math.cos(a) * (150 + 120 * sk), Rb.y + Math.sin(a) * (150 + 120 * sk), sk, col('signal', 0.8), 4); }
+  }
+  note(c, 'OPTION A', Lb.x, Lb.y - 30, rk * 0.6, 20, 'ash', 'center');
+  screen(s);
+  const ti = l2.words.findIndex((w) => /^and$/i.test(clean(w.w)));
+  band(c, 150, 260, 0.7); band(c, 930, 230, 0.7);
+  row(s, l2.words.slice(0, ti > 0 ? ti : 3), A(100, 900), 1300, 180, W / 2, 150);
+  row(s, l2.words.slice(ti > 0 ? ti : 3), A(125, 900), 1300, 160, W / 2, 930);
+}
+
+// ================================================================== FRAME: break the loop, change the frame; risk before gain
+function splitWord(s: S, w: Word, text: string, fam: string, size: number, x: number, y: number, k: number) {
+  const { c } = s;
+  const m = measure(text, fam, size);
+  if (k <= 0) { word(s, w, text, fam, size, x, y, { sc: slam(w, s.t, 1.6) }); return; }
+  const off = 6 * k;
+  c.save(); c.beginPath(); c.rect(x - m, y - size, m, size * 2); c.clip();
+  word(s, w, text, fam, size, x, y - off, { color: col('bone', 1), glow: 0 }); c.restore();
+  c.save(); c.beginPath(); c.rect(x, y - size, m, size * 2); c.clip();
+  word(s, w, text, fam, size, x, y + off, { color: col('signal', 1), glow: 0 }); c.restore();
+}
+function frame(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.35; s.bg.grid = 0.4;
+  const a1 = until(t, l2);
+  const breakW = findW(l1, /break/i), loopW = findW(l1, /loop/i), chW = findW(l1, /change/i), frW = findW(l1, /frame/i);
+  const rot = snapVal(t, [sh.start, chW.start - 0.05], [0, -0.035], 0.5, ease.outBack);
+  cam(s, { x: W / 2, y: H / 2, z: 1, r: rot * a1 });
+  if (a1 > 0) {
+    // the loop: a spinning ring with an arrowhead; breaks into arcs on LOOP
+    const R = 300, cx = W / 2, cy = H / 2 - 40;
+    const spin = t * 2.2;
+    const bk = prog(t, loopW.start, loopW.start + 0.9, ease.outCubic);
+    for (let i = 0; i < 8; i++) {
+      const a0 = spin + (i / 8) * TAU, a1b = a0 + TAU / 8 - 0.04;
+      const dir = a0 + TAU / 16;
+      const dx = Math.cos(dir) * 600 * bk, dy = Math.sin(dir) * 600 * bk;
+      c.strokeStyle = col(i === 0 ? 'signal' : 'ash', (1 - bk) * 0.9 * a1); c.lineWidth = 16; c.lineCap = 'butt';
+      c.beginPath(); c.arc(cx + dx, cy + dy, R, a0, a1b); c.stroke();
+    }
+    if (t > breakW.start && bk === 0) { c.strokeStyle = col('signal', 1); c.lineWidth = 6; c.beginPath(); c.moveTo(cx + R - 30, cy - 20); c.lineTo(cx + R + 10, cy + 6); c.lineTo(cx + R - 16, cy + 30); c.stroke(); }
+    // the frame: corner brackets that rotate and change aspect on CHANGE
+    const fk = clamp(springStep(t - chW.start, 2.2, 0.5), 0, 1.1) * (t > chW.start - 0.05 ? 1 : 0);
+    const fw = lerp(1600, 1000, fk), fh = lerp(860, 900, fk), fr = lerp(0, -0.12, fk);
+    c.save(); c.translate(W / 2, H / 2); c.rotate(fr);
+    c.strokeStyle = col('bone', 0.85 * a1); c.lineWidth = 6;
+    for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]] as const) {
+      c.beginPath(); c.moveTo(sx * fw / 2, sy * fh / 2 - sy * 70); c.lineTo(sx * fw / 2, sy * fh / 2); c.lineTo(sx * fw / 2 - sx * 70, sy * fh / 2); c.stroke();
+    }
+    note(c, fk > 0.5 ? '1:1' : '16:9', fw / 2 - 10, -fh / 2 + 34, 0.7 * a1, 18, 'ash', 'right');
+    c.restore();
+    // type: BREAK / CHANGE / FRAME split two-tone once sung
+    const ti = l1.words.indexOf(chW) > 0 ? l1.words.findIndex((w) => /^and$/i.test(clean(w.w))) : -1;
+    const r1 = ti > 0 ? l1.words.slice(0, ti) : l1.words.slice(0, 3), r2 = l1.words.slice(r1.length);
+    const lay = (rw: Word[], fam: string, width: number, max: number, y: number) => {
+      const fr2 = fitRow(rw.map(txt), fam, width, max);
+      rw.forEach((w, i) => {
+        if (/^(break|change|frame)$/i.test(clean(w.w)) && a1 > 0) splitWord(s, w, txt(w), fam, fr2.size, W / 2 + fr2.xs[i]!, y, prog(t, w.start + 0.12, w.start + 0.3, ease.outExpo));
+        else word(s, w, txt(w), fam, fr2.size, W / 2 + fr2.xs[i]!, y, { sc: slam(w, t, 1.6), alpha: a1 });
+      });
+    };
+    c.save(); c.globalAlpha = a1; lay(r1, A(125, 900), 1400, 220, H / 2 - 40); lay(r2, A(100, 900), 1300, 170, H / 2 + 260); c.restore();
+  }
+  if (!l2) return;
+  // risk before gain: a chart dips then climbs to the peak
+  screen(s);
+  const ws = l2.words;
+  const riskW = findW(l2, /risk/i), gainW = findW(l2, /gain/i);
+  const X0 = 240, X1 = W - 240, YB = 740;
+  const ck = prog(t, l2.start - 0.15, l2.start + 0.35, ease.outExpo);
+  rule(c, X0, YB, X1, YB, ck, col('ash', 0.7), 3);
+  const pts: V2[] = [{ x: X0, y: YB - 120 }, { x: X0 + 300, y: YB - 150 }, { x: X0 + 560, y: YB + 120 }, { x: X0 + 820, y: YB - 40 }, { x: X0 + 1100, y: YB - 260 }, { x: X1, y: YB - 430 }];
+  const PL = polylineLengths(pts), tot = last(Array.from(PL));
+  const at = snapVal(t, [l2.start - 0.15, riskW.start - 0.1, ...ws.slice(ws.indexOf(riskW) + 1).map((w) => w.start - 0.05)], [0, PL[2]!, ...ws.slice(ws.indexOf(riskW) + 1).map((w) => (w === gainW ? tot : lerp(PL[2]!, PL[4]!, 0.5)))], 0.4, ease.outCubic);
+  drawTr(c, { pts, L: PL, len: tot, d: 0 }, at / tot, col('signal', 1), 6, false);
+  drawTr(g, { pts, L: PL, len: tot, d: 0 }, at / tot, col('signal', 0.35), 14, false);
+  head(g, pts, PL, at, col('ember', 0.9), 16);
+  if (t > riskW.start) { c.fillStyle = col('ash', 0.25); c.fillRect(X0 + 420, YB - 60, 300, 200); note(c, 'DRAWDOWN · TESTED', X0 + 570, YB + 175, 0.8, 16, 'ash', 'center'); }
+  const gi = ws.findIndex((w) => /^before$/i.test(clean(w.w)));
+  band(c, 160, 260, 0.6);
+  row(s, ws.slice(0, gi > 0 ? gi : 3), A(100, 900), 1300, 180, W / 2, 160);
+  row(s, ws.slice(gi > 0 ? gi : 3), A(125, 900), 1300, 160, W / 2, 930);
+}
+
+// ================================================================== SPARK: human questions, tools that grow; keep the spark, let it show
+function spark(s: S) {
+  const { t, sh, c, g, au } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.4; s.bg.stars = 0.7;
+  const conv = l2 ? prog(t, l2.start - 0.25, l2.start + 0.5, ease.inOutCubic) : 0;
+  const showW = l2 ? last(l2.words) : null;
+  const burst = showW ? prog(t, showW.start - 0.04, showW.start + 1.2, ease.outCubic) : 0;
+  cam(s, { x: W / 2, y: H / 2, z: 1 + 0.06 * burst, r: 0 });
+  if (showW) s.post.shake = [noise1(t * 50, 1) * 12 * pulse(t, showW.start, 0.1), noise1(t * 50, 2) * 8 * pulse(t, showW.start, 0.1)];
+  const a1 = 1 - conv;
+  const C = { x: W / 2, y: H / 2 + 20 };
+  if (a1 > 0) {
+    // a head in profile with questions rising
+    const hx = lerp(470, C.x, conv), hy = lerp(560, C.y, conv), hs = lerp(1, 0.1, conv);
+    c.save(); c.translate(hx, hy); c.scale(hs, hs); c.globalAlpha = a1;
+    c.strokeStyle = col('bone', 0.9); c.lineWidth = 6;
+    c.beginPath(); c.moveTo(-120, 220); c.bezierCurveTo(-150, 60, -170, -180, 10, -210); c.bezierCurveTo(170, -230, 210, -80, 170, 10); c.lineTo(210, 70); c.lineTo(165, 85); c.bezierCurveTo(175, 160, 120, 170, 70, 165); c.lineTo(60, 220); c.stroke();
+    for (let i = 0; i < 6; i++) {
+      const w = l1.words[Math.min(1, l1.words.length - 1)]!;
+      const u = ((t - w.start + i * 0.35) % 2.1) / 2.1;
+      if (t < w.start - 0.1) continue;
+      note(c, '?', -20 + (hash(i, 1) - 0.5) * 180, -240 - u * 260, (1 - u) * 0.9, 44 + i * 6, i % 2 ? 'signal' : 'bone', 'center');
+    }
+    c.restore();
+    // tools grow out of it
+    const tw = findW(l1, /tools/i), gw = findW(l1, /grow/i);
+    const icons = [gearIcon, wrenchIcon, chipIcon, gearIcon];
+    const spots = [[880, 380], [1130, 600], [1380, 360], [1600, 620]];
+    spots.forEach(([x, y], i) => {
+      const w = i < 2 ? tw : gw;
+      const k = prog(t, w.start + (i % 2) * 0.2, w.start + (i % 2) * 0.2 + 0.5, ease.outBack);
+      if (k <= 0) return;
+      const px = lerp(x!, C.x, conv), py = lerp(y!, C.y, conv);
+      rule(c, lerp(650, C.x, conv), lerp(520, C.y, conv), px, py, clamp(k), col('graphite', a1), 4);
+      const grow2 = 1 + 0.4 * prog(t, gw.start, gw.start + 1, ease.outCubic);
+      c.save(); c.globalAlpha = a1; icons[i]!(c, px, py, 130 * clamp(k, 0, 1.2) * grow2, 1, t * 0.8); c.restore();
+    });
+    band(c, 150, 250, 0.7 * a1); band(c, 940, 230, 0.7 * a1);
+    const qi = l1.words.indexOf(tw);
+    row(s, l1.words.slice(0, qi > 0 ? qi : 2), A(100, 900), 1400, 180, W / 2, 150, { alpha: a1 });
+    row(s, l1.words.slice(qi > 0 ? qi : 2), A(125, 900), 1300, 160, W / 2, 940, { alpha: a1 });
+  }
+  if (!l2) return;
+  // the spark (the opening's) held at the centre, then it bursts into circuits
+  const kick = au.env('low', t);
+  const r = (12 + 12 * kick) * conv * (1 + 2 * pulse(t, showW!.start, 0.3));
+  c.fillStyle = col('ember', 1); c.beginPath(); c.arc(C.x, C.y, r * 0.6, 0, TAU); c.fill();
+  g.fillStyle = col('signal', 0.85); g.beginPath(); g.arc(C.x, C.y, r * 3.2, 0, TAU); g.fill();
+  if (burst > 0) {
+    const trs = traces('spark', 77, 34, C.x, C.y, 1100, 700);
+    trs.forEach((tr) => { drawTr(c, tr, burst * (0.7 + 0.3 * tr.d), col('signal', 0.8), 3); drawTr(g, tr, burst * (0.7 + 0.3 * tr.d), col('signal', 0.3), 8); });
+    for (let i = 0; i < 24; i++) { const a = (i / 24) * TAU; rule(g, C.x + Math.cos(a) * 60, C.y + Math.sin(a) * 60, C.x + Math.cos(a) * (60 + 900 * burst), C.y + Math.sin(a) * (60 + 900 * burst), 1, col('signal', 0.3 * (1 - burst)), 4); }
+  }
+  screen(s);
+  const ai = l2.words.findIndex((w) => /^and$/i.test(clean(w.w)));
+  band(c, 160, 260, 0.6); band(c, 930, 240, 0.6);
+  row(s, l2.words.slice(0, ai > 0 ? ai : 3), A(100, 900), 1300, 190, W / 2, 160);
+  row(s, l2.words.slice(ai > 0 ? ai : 3), A(125, 900), 1300, 170, W / 2, 930);
+}
+
+// ================================================================== FINALE: the city from above is a circuit board; neural sparks
+function finale(s: S) {
+  const { t, sh, c, g } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const glow = last(ws);
+  s.bg.glow = 0.5; s.bg.stars = 0.3; s.bg.grid = 0;
+  const times = [sh.start, ...ws.map((w) => w.start - 0.05)];
+  const k = { x: W / 2, y: H / 2, z: snapVal(t, times, [1.35, ...ws.map((_, i) => 1.3 - i * 0.08)], 0.5), r: snapVal(t, times, [0.12, ...ws.map((_, i) => 0.12 - i * 0.03)], 0.6) };
+  cam(s, k);
+  // city blocks (top view) between street traces
+  const N = 11, cs = 260;
+  const lit = prog(t, glow.start - 0.05, glow.start + 0.5, ease.outCubic);
+  for (let i = -N; i <= N; i++) for (let j = -N; j <= N; j++) {
+    const x = W / 2 + i * cs, y = H / 2 + j * cs;
+    const h = hash(i + 50, j + 50);
+    c.fillStyle = col('ink2', 0.95); c.fillRect(x + 30, y + 30, cs - 60, cs - 60);
+    c.strokeStyle = col('graphite', 1); c.lineWidth = 2; c.strokeRect(x + 30, y + 30, cs - 60, cs - 60);
+    if (h < 0.5) { c.fillStyle = col('acid', 0.5 + 0.4 * lit); c.fillRect(x + 60 + h * 60, y + 60, 40, 40); }
+    if (h > 0.8) { c.strokeStyle = col('signal', 0.5 + 0.5 * lit); c.strokeRect(x + 80, y + 80, cs - 160, cs - 160); }
+  }
+  // signals along the streets
+  for (let i = 0; i < 40; i++) {
+    const horiz = i % 2 === 0;
+    const lane = Math.floor(hash(i, 1) * 2 * N) - N;
+    const sp = 500 + hash(i, 2) * 600;
+    const p = ((hash(i, 3) * 6000 + t * sp) % 6000) - 3000;
+    const x = horiz ? W / 2 + p : W / 2 + lane * cs, y = horiz ? H / 2 + lane * cs : H / 2 + p;
+    g.fillStyle = col('signal', 0.9); g.beginPath(); g.arc(x, y, 9, 0, TAU); g.fill();
+    c.fillStyle = col('ember', 1); c.beginPath(); c.arc(x, y, 4, 0, TAU); c.fill();
+    const tail = horiz ? [-120, 0] : [0, -120];
+    rule(g, x, y, x + tail[0]!, y + tail[1]!, 1, col('signal', 0.3), 6);
+  }
+  if (lit > 0) { g.fillStyle = col('signal', 0.12 * lit); g.fillRect(-W, -H, 3 * W, 3 * H); }
+  screen(s);
+  band(c, H / 2 - 20, 620, 0.7);
+  const ti = ws.findIndex((w) => /^the$/i.test(clean(w.w)));
+  row(s, ws.slice(0, ti > 0 ? ti : 2), A(125, 900), 1500, 230, W / 2, H / 2 - 130);
+  row(s, ws.slice(ti > 0 ? ti : 2), A(100, 900), 1300, 170, W / 2, H / 2 + 130);
+}
+
+// ================================================================== ENDCARD: FRONTIER FRIDAY with Earl Co, over the full city
+function endcard(s: S) {
+  const { t, sh, c, g, au } = s;
+  const l = sh.lines[0]!;
+  const ws = l.words;
+  const [fw, fr] = ws as [Word, Word];
+  const rest = ws.slice(2);
+  s.bg.glow = 0.7; s.bg.gy = 0.8; s.bg.stars = 1; s.bg.grid = 0.4;
+  cam(s, { x: W / 2 + 80 * prog(t, sh.start, sh.end), y: H / 2, z: 1, r: 0 });
+  drawCity(s, 4, H - 20, { lit: 0.8, scale: 0.7, xs: [-600, W + 800], a: 0.8 });
+  screen(s);
+  band(c, H / 2 - 60, 720, 0.65);
+  const fa = A(125, 900), fb = A(125, 300);
+  const sa = sizeFor('FRONTIER', fa, 1500), sb = sizeFor('FRIDAY', fb, 1050);
+  const yA = H / 2 - 200;
+  drawLetters(c, 'FRONTIER', fa, sa, W / 2 - measure('FRONTIER', fa, sa) / 2, yA + (CAP * sa) / 2, fw.start - 0.06, t, (_i, k) => mix('bone', 'signal', heat(fw, t), k), { stagger: 0.03, dy: -120, dur: 0.35 });
+  const yB = yA + sa * CAP / 2 + 40 + sb * CAP / 2;
+  word(s, fr, 'FRIDAY', fb, sb, W / 2, yB, { sc: slam(fr, t, 1.5), base: 'signal', hot: 'ember' });
+  row(s, rest, A(100, 700), 760, 90, W / 2, yB + sb * CAP / 2 + 100);
+  note(c, BRAND.tagline, W / 2, yB + sb * CAP / 2 + 190, prog(t, last(ws).end + 0.4, last(ws).end + 1), 24, 'ash', 'center');
+  // the spark returns under the title
+  const kick = au.env('low', t);
+  const sr = 10 + 10 * kick;
+  c.fillStyle = col('ember', 1); c.beginPath(); c.arc(W / 2, 110, sr * 0.6, 0, TAU); c.fill();
+  g.fillStyle = col('signal', 0.8); g.beginPath(); g.arc(W / 2, 110, sr * 3, 0, TAU); g.fill();
+  s.post.fade = prog(t, sh.end - 1.8, sh.end - 0.1, ease.inOutCubic);
+}
+
+
+// ================================================================== WINDOWS: a facade's windows swing open; pan down to the foundations
+function windows(s: S) {
+  const { t, sh, c, g } = s;
+  const [l1, l2] = sh.lines as [Line, Line?];
+  s.bg.glow = 0.45; s.bg.stars = 0.7; s.bg.grid = 0;
+  const down = l2 ? prog(t, l2.start - 0.3, l2.start + 0.6, ease.inOutCubic) : 0;
+  const GY = 880; // ground line (world)
+  cam(s, { x: W / 2, y: lerp(H / 2 - 40, H / 2 + 520, down), z: 1, r: lerp(-0.008, 0.006, down) });
+  // facade: 3 storeys x 5 bays
+  const fx0 = 360, fx1 = W - 360, top = 140;
+  c.fillStyle = col('ink2', 1); c.fillRect(fx0, top, fx1 - fx0, GY - top);
+  c.strokeStyle = col('bone', 0.8); c.lineWidth = 5; c.strokeRect(fx0, top, fx1 - fx0, GY - top);
+  const bays = 5, sto = 3, bw = (fx1 - fx0) / bays, shh = (GY - top) / sto;
+  const ws1 = l1.words;
+  for (let i = 0; i < bays; i++) for (let j = 0; j < sto; j++) {
+    const id = i + j * bays;
+    const w = ws1[Math.min(ws1.length - 1, Math.floor(hash(id, 4) * ws1.length))]!;
+    const ok = prog(t, w.start - 0.05 + hash(id, 2) * 0.25, w.start + 0.4 + hash(id, 2) * 0.25, ease.outBack);
+    const x = fx0 + i * bw + bw * 0.22, y = top + j * shh + shh * 0.2, ww = bw * 0.56, wh = shh * 0.6;
+    c.fillStyle = col('acid', 0.15 + 0.75 * clamp(ok)); c.fillRect(x, y, ww, wh);
+    if (ok > 0.05) { g.fillStyle = col('acid', 0.25 * clamp(ok)); g.fillRect(x - 6, y - 6, ww + 12, wh + 12); }
+    // shutters swing out (perspective squeeze)
+    const sw = (ww / 2) * Math.cos(clamp(ok, 0, 1.1) * Math.PI * 0.45);
+    c.fillStyle = col('graphite', 1); c.strokeStyle = col('bone', 0.7); c.lineWidth = 2;
+    c.fillRect(x - (ww / 2 - sw) * 0.3, y, sw, wh); c.strokeRect(x - (ww / 2 - sw) * 0.3, y, sw, wh);
+    c.fillRect(x + ww - sw + (ww / 2 - sw) * 0.3, y, sw, wh); c.strokeRect(x + ww - sw + (ww / 2 - sw) * 0.3, y, sw, wh);
+    // breathing air: curls out of open windows on "breathe"
+    const br = findW(l1, /breathe/i);
+    const bk = prog(t, br.start, br.start + 1.4, ease.outCubic);
+    if (bk > 0 && hash(id, 8) < 0.6) {
+      c.strokeStyle = col('signal', 0.6 * (1 - bk * 0.6)); c.lineWidth = 3; c.beginPath();
+      for (let k = 0; k <= 20; k++) { const u = k / 20 * bk; const px = x + ww / 2 + u * 160 * (i < 2 ? -1 : 1), py = y + wh / 2 - u * 90 + Math.sin(u * 12 + t * 3) * 14; k ? c.lineTo(px, py) : c.moveTo(px, py); }
+      c.stroke();
+    }
+  }
+  // ground and foundations below
+  c.fillStyle = col('ink', 0.95); c.fillRect(-200, GY, W + 400, 1200);
+  rule(c, -200, GY, W + 200, GY, 1, col('bone', 0.7), 4);
+  if (l2) {
+    const fnd = findW(l2, /foundation/i), und = last(l2.words);
+    for (let r = 0; r < 4; r++) for (let i = 0; i < 9; i++) {
+      const k = prog(t, fnd.start - 0.1 + (r * 9 + i) * 0.018, fnd.start + 0.25 + (r * 9 + i) * 0.018, ease.outExpo);
+      if (k <= 0) continue;
+      const bx = fx0 - 60 + i * ((fx1 - fx0 + 120) / 9) + (r % 2) * 40, by = GY + 20 + r * 92 + (1 - k) * 160;
+      c.fillStyle = col('acid', 0.75 * k); c.fillRect(bx, by, (fx1 - fx0 + 120) / 9 - 10, 82);
+    }
+    const uk = prog(t, und.start - 0.05, und.start + 0.5, ease.outExpo);
+    for (let i = 0; i < 12; i++) rule(c, fx0 + i * 110, GY + 400, fx0 + i * 110 + (i % 2 ? 40 : -40), GY + 400 + 160 * uk, 1, col('graphite', 1), 6);
+  }
+  // type in screen space
+  screen(s);
+  const a1 = until(t, l2);
+  const [r1, r2] = split2(l1);
+  band(c, 180, 280, 0.75 * a1); band(c, 920, 260, 0.75 * a1);
+  row(s, r1, A(100, 900), 1400, 200, W / 2, 180, { alpha: a1 });
+  row(s, r2, A(125, 900), 1300, 180, W / 2, 920, { alpha: a1 });
+  if (!l2) return;
+  const [q1, q2] = split2(l2);
+  band(c, 180, 280, 0.75); 
+  row(s, q1, A(125, 900), 1500, 200, W / 2, 180);
+  row(s, q2, A(100, 900), 1100, 170, W / 2, 400, { hot: 'signal' });
+}
+
+export const EXTRA: Record<string, (s: S) => void> = {
+  boot, windows, neural, wire, learn, prompt, zoom, edge, hook, earl, morph, tomorrow, city, flow, future, plan, unlock, skyline, chain, vote, frame, spark, finale, endcard,
+};

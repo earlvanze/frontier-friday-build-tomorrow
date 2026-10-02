@@ -1,0 +1,22 @@
+# Dependency trees and local Python environments
+app/node_modules/
+analysis/.venv/
+
+# Generated analysis and rendered-media artifacts
+analysis/work/
+audio/
+data/
+out/
+qa/
+*.mp4
+*.m4a
+*.wav
+*.webm
+
+# Local environment and tool output
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+*.tsbuildinfo

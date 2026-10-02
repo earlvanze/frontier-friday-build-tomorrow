@@ -1,0 +1,29 @@
+// Frontier Friday edit, by section (the director reads the [section] tags in data/lyrics.json).
+// The story: a neural spark becomes a signal, the signal becomes a plan, the plan becomes a street, a house, a ledger,
+// a chain, a city — and every chorus the same city has grown. Ends on the opening spark.
+// Count-0 specs are instrumental shots placed at { at } or { afterPrev } seconds.
+export type Spec = [kind: string, lines: number, opts?: Record<string, any>];
+
+const chorus = (n: number): Spec[] => [
+  ['hook', 1, { n, v: 0 }], // FRONTIER FRIDAY here we go (skyline at stage n)
+  ['earl', 1, { n }], // with Earl Co · watch ideas GROW
+  ['morph', 1, { n }], // bricks -> blocks -> code -> keys
+  ['tomorrow', 1, { n }], // TOMORROW assembled piece by piece
+  ['city', 1, { n }], // AI · TECH signs, the cities glow (pan)
+  ['flow', 1, { n }], // crypto moving, letters ride the flow
+  ['hook', 1, { n, v: 1 }], // second hook: swung perspective
+  ['future', 1, { n }], // see the FUTURE with Earl Co (horizon)
+];
+
+export const SECTIONS: Record<string, (occ: number, count: number) => Spec[]> = {
+  verse: (o, c) =>
+    c === 12
+      ? o === 1
+        ? [['boot', 0, { at: 0 }], ['neural', 2], ['wire', 2], ['learn', 2], ['prompt', 2], ['zoom', 2, { n: 1 }], ['edge', 2, { n: 1 }]]
+        : [['plan', 2, { bg: { paper: 1 } }], ['windows', 2], ['unlock', 2], ['ledger', 2, { bg: { grid: 1.0 } }],
+           ['zoom', 2, { n: 2 }], ['edge', 2, { n: 2 }]]
+      : [['slam', c]],
+  chorus: (n, c) => (c === 8 ? [...chorus(n), ...(n === 2 ? ([['skyline', 0, { afterPrev: 1.7 }]] as Spec[]) : [])] : [['slam', c]]),
+  bridge: (_o, c) => (c === 8 ? [['chain', 2], ['vote', 2], ['frame', 2], ['spark', 2]] : [['slam', c]]),
+  outro: (_o, c) => (c === 3 ? [['future', 1, { n: 4 }], ['finale', 1], ['endcard', 1]] : [['slam', c]]),
+};
